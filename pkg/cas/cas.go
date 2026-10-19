@@ -34,6 +34,7 @@ type BlobManifest struct {
 // Store provides content-addressable storage on local disk
 type Store struct {
 	baseDir string
+	remote  RemoteStorage
 	mu      sync.RWMutex
 }
 
@@ -44,6 +45,20 @@ func NewStore(baseDir string) (*Store, error) {
 		return nil, fmt.Errorf("failed to create CAS objects dir: %w", err)
 	}
 	return &Store{baseDir: baseDir}, nil
+}
+
+// SetRemote attaches an S3 or MinIO distributed remote storage tier
+func (s *Store) SetRemote(remote RemoteStorage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.remote = remote
+}
+
+// GetRemote returns attached remote storage tier if any
+func (s *Store) GetRemote() RemoteStorage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.remote
 }
 
 func HashBytes(data []byte) string {
@@ -59,44 +74,65 @@ func (s *Store) chunkPath(hash string) string {
 	return filepath.Join(s.baseDir, "objects", hash[0:2], hash[2:4], hash+".chunk")
 }
 
-// PutChunk stores a compressed chunk if not already present
+// PutChunk stores a compressed chunk locally and uploads to S3 if configured
 func (s *Store) PutChunk(chunk *BlobChunk) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	targetPath := s.chunkPath(chunk.Hash)
-	if _, err := os.Stat(targetPath); err == nil {
-		// Already stored, deduplicated
-		return nil
+	if _, err := os.Stat(targetPath); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return err
+		}
+		tmpFile := targetPath + ".tmp"
+		if err := os.WriteFile(tmpFile, chunk.Data, 0644); err != nil {
+			return err
+		}
+		_ = os.Rename(tmpFile, targetPath)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return err
+	// Upload to S3 / MinIO backend if attached
+	if s.remote != nil {
+		_ = s.remote.PutChunk(chunk.Hash, chunk.Data)
 	}
-
-	tmpFile := targetPath + ".tmp"
-	if err := os.WriteFile(tmpFile, chunk.Data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpFile, targetPath)
+	return nil
 }
 
-// GetChunk retrieves and returns the raw compressed chunk
+// GetChunk retrieves chunk from local disk cache, falling back to S3/MinIO
 func (s *Store) GetChunk(hash string) (*BlobChunk, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	remoteStore := s.remote
 	targetPath := s.chunkPath(hash)
 	compressedData, err := os.ReadFile(targetPath)
-	if err != nil {
-		return nil, fmt.Errorf("chunk not found: %s: %w", hash, err)
+	s.mu.RUnlock()
+
+	if err == nil {
+		return &BlobChunk{
+			Hash: hash,
+			Data: compressedData,
+		}, nil
 	}
 
-	return &BlobChunk{
-		Hash: hash,
-		Data: compressedData,
-	}, nil
+	// Cache miss on local disk — fetch from distributed S3 / MinIO
+	if remoteStore != nil {
+		data, s3Err := remoteStore.GetChunk(hash)
+		if s3Err == nil {
+			// Populate local cache
+			s.mu.Lock()
+			_ = os.MkdirAll(filepath.Dir(targetPath), 0755)
+			_ = os.WriteFile(targetPath, data, 0644)
+			s.mu.Unlock()
+
+			return &BlobChunk{
+				Hash: hash,
+				Data: data,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("chunk not found: %s: %w", hash, err)
 }
+
 
 // PutBlob processes raw content: chunks it, compresses each chunk, stores chunks, and returns manifest
 func (s *Store) PutBlob(content []byte) (*BlobManifest, error) {
@@ -200,13 +236,31 @@ func (s *Store) saveManifest(m *BlobManifest) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(mPath, data, 0644)
+	if err := os.WriteFile(mPath, data, 0644); err != nil {
+		return err
+	}
+
+	if s.remote != nil {
+		_ = s.remote.PutManifest(m.BlobHash, data)
+	}
+	return nil
 }
 
 func (s *Store) GetManifest(blobHash string) (*BlobManifest, error) {
 	mPath := s.manifestPath(blobHash)
 	data, err := os.ReadFile(mPath)
 	if err != nil {
+		if s.remote != nil {
+			s3Data, s3Err := s.remote.GetManifest(blobHash)
+			if s3Err == nil {
+				_ = os.MkdirAll(filepath.Dir(mPath), 0755)
+				_ = os.WriteFile(mPath, s3Data, 0644)
+				var m BlobManifest
+				if err := json.Unmarshal(s3Data, &m); err == nil {
+					return &m, nil
+				}
+			}
+		}
 		return nil, fmt.Errorf("manifest not found for blob %s: %w", blobHash, err)
 	}
 	var m BlobManifest

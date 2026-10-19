@@ -600,6 +600,8 @@ func cmdServe(args []string) {
 	dbURL := fs.String("db", "", "Database URL: SQLite file path or postgres://user:pass@host:5432/db")
 	fs.StringVar(dbURL, "database-url", "", "Alias for --db")
 	casDirFlag := fs.String("cas-dir", "", "Custom CAS storage path")
+	s3BucketFlag := fs.String("s3-bucket", "", "S3 / MinIO bucket name (or S3_BUCKET env)")
+	s3EndpointFlag := fs.String("s3-endpoint", "", "S3 / MinIO endpoint host (or S3_ENDPOINT env)")
 	fs.Parse(args)
 
 	finalDB := *dbURL
@@ -622,6 +624,26 @@ func cmdServe(args []string) {
 		log.Fatalf("CAS initialization error: %v", err)
 	}
 
+	// Connect S3 / MinIO distributed tier if configured
+	var s3Store *cas.S3Store
+	if *s3BucketFlag != "" {
+		s3Store, err = cas.NewS3Store(cas.S3Config{
+			Bucket:          *s3BucketFlag,
+			Endpoint:        *s3EndpointFlag,
+			AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+			SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+			UseSSL:          !strings.HasPrefix(*s3EndpointFlag, "http://"),
+		})
+		if err != nil {
+			fmt.Printf("%sWarning: S3 init failed: %v%s\n", ui.Yellow, err, ui.Reset)
+		}
+	} else {
+		s3Store, _ = cas.NewS3StoreFromEnv()
+	}
+	if s3Store != nil {
+		store.SetRemote(s3Store)
+	}
+
 	database, err := db.Open(finalDB)
 	if err != nil {
 		log.Fatalf("Database connection error: %v", err)
@@ -639,7 +661,11 @@ func cmdServe(args []string) {
 	} else {
 		fmt.Printf("• Database Engine:  %sSQLite WAL (%s)%s\n", ui.Cyan, finalDB, ui.Reset)
 	}
-	fmt.Printf("• CAS Storage:      %s\n", finalCAS)
+	if s3Store != nil {
+		fmt.Printf("• CAS Storage:      %sDistributed S3 / MinIO Cluster%s (local cache: %s)\n", ui.BrightGreen, ui.Reset, finalCAS)
+	} else {
+		fmt.Printf("• CAS Storage:      %sLocal High-Speed Cache%s (%s)\n", ui.Cyan, ui.Reset, finalCAS)
+	}
 	fmt.Println()
 	fmt.Println("Team members can connect with:")
 	fmt.Printf("  %sscion remote add origin http://<this-server-ip>:%s%s\n", ui.BrightCyan, *port, ui.Reset)

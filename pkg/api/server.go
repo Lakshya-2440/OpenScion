@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -69,6 +71,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/query/blame", s.handleQueryBlame)
 	s.mux.HandleFunc("GET /api/v1/query/diff", s.handleQueryDiff)
 	s.mux.HandleFunc("GET /api/v1/queue/status", s.handleQueueStatus)
+
+	// Web Console & Static Assets (SPA fallback)
+	s.mux.HandleFunc("/", s.handleWebConsole)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -481,3 +486,46 @@ func filepathClean(p string) string {
 	p = strings.ReplaceAll(p, "\\", "/")
 	return p
 }
+
+func (s *Server) handleWebConsole(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		writeError(w, http.StatusNotFound, "api endpoint not found")
+		return
+	}
+
+	distCandidates := []string{
+		"web/dist",
+		"./web/dist",
+		"../web/dist",
+	}
+
+	var distDir string
+	for _, c := range distCandidates {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			distDir = c
+			break
+		}
+	}
+
+	if distDir == "" {
+		http.Redirect(w, r, "http://localhost:3000", http.StatusTemporaryRedirect)
+		return
+	}
+
+	reqPath := filepath.Clean(r.URL.Path)
+	filePath := filepath.Join(distDir, reqPath)
+	info, err := os.Stat(filePath)
+	if err == nil && !info.IsDir() {
+		http.ServeFile(w, r, filePath)
+		return
+	}
+
+	indexPath := filepath.Join(distDir, "index.html")
+	if _, err := os.Stat(indexPath); err == nil {
+		http.ServeFile(w, r, indexPath)
+		return
+	}
+
+	http.NotFound(w, r)
+}
+

@@ -46,6 +46,12 @@ func main() {
 		log.Fatalf("Failed to initialize CAS store: %v", err)
 	}
 
+	if s3Store, err := cas.NewS3StoreFromEnv(); err == nil && s3Store != nil {
+		store.SetRemote(s3Store)
+		log.Printf("[OPENSCION] S3 / MinIO distributed CAS backing store connected\n")
+	}
+
+
 	// Initialize Database
 	database, err := db.Open(*dbPath)
 	if err != nil {

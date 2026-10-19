@@ -11,19 +11,21 @@ Works **directly in the terminal like `git`** with zero external servers or back
 
 ---
 
-## 1. Installation
+## 1. Quick Install
 
-Run `make install` to compile and install `scion` into your PATH:
+Install in one command with `curl`:
 
 ```bash
-make install
+curl -fsSL https://raw.githubusercontent.com/Lakshya-2440/OpenScion/main/install.sh | bash
 ```
-This builds and installs `scion` directly to `~/.local/bin/scion` (and alias `scn`).
+
+*(Or compile locally with `make install`)*
 
 Verify installation:
 ```bash
 scion --help
 ```
+
 
 ---
 

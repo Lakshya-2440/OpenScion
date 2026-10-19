@@ -110,6 +110,11 @@ if [ "$INSTALLED" -eq 0 ]; then
   fi
 fi
 
+# Ad-hoc codesign on macOS to prevent SIGKILL 137
+if [ "$PLATFORM" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+  codesign -s - -f "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
+fi
+
 # 5. Check PATH and configure shell profile if needed
 echo ""
 echo -e "${GREEN}${BOLD}✓ OpenScion installed to: ${INSTALL_DIR}/${BINARY_NAME}${RESET}"

@@ -48,6 +48,14 @@ func main() {
 		cmdClone(args)
 	case "mount":
 		cmdMount(args)
+	case "remote":
+		cmdRemote(args)
+	case "push":
+		cmdPush(args)
+	case "pull":
+		cmdPull(args)
+	case "sync":
+		cmdSync(args)
 	case "serve":
 		cmdServe(args)
 	case "help", "--help", "-h":
@@ -62,7 +70,7 @@ func printUsage() {
 	fmt.Printf("%s%sOpenScion — Agent-Scale Terminal Version Control System%s\n\n", ui.Bold, ui.BrightCyan, ui.Reset)
 	fmt.Println("Usage: scion <command> [options]")
 	fmt.Println()
-	fmt.Println("Core Git-like Commands (Runs directly in terminal):")
+	fmt.Println("Core Git-like Commands (Runs directly on machine):")
 	fmt.Println("  init [repo-name]              Initialize an OpenScion repository in current directory")
 	fmt.Println("  status [-v]                   Show working tree status and categorized changes")
 	fmt.Println("  diff [-s|-a] [file]           Inspect colorized diffs (summary, hunk view, or stat)")
@@ -73,12 +81,17 @@ func printUsage() {
 	fmt.Println("  clone <source> [dir]          Fast sparse clone from local path or remote repository")
 	fmt.Println("  mount [dir] [--rev #seq]      Mount virtual filesystem (instant 0-byte ghost tree, lazy fetch)")
 	fmt.Println()
-	fmt.Println("Server & Collaboration:")
-	fmt.Println("  serve [--port 8080]           Start an OpenScion central hub server for multi-agent teams")
+	fmt.Println("Remote & Team Collaboration:")
+	fmt.Println("  remote [add|set-url|rm] <url> Configure remote team server (origin)")
+	fmt.Println("  push                          Push local changesets to remote merge queue")
+	fmt.Println("  pull                          Pull latest changesets and materialize updated files")
+	fmt.Println("  sync                          Pull and push in a single command")
+	fmt.Println("  serve [--port] [--db URL]     Launch central server (supports SQLite & PostgreSQL/CockroachDB)")
 	fmt.Println()
 	fmt.Println("Flags:")
 	fmt.Println("  --agent <model>               Tag commit with AI agent model (e.g. claude-code-3.7-sonnet)")
 	fmt.Println("  --sparse <patterns>           Specify sparse path filter (e.g. 'src/**,config/*')")
+	fmt.Println("  --db, --database-url          PostgreSQL or SQLite connection string for server")
 	fmt.Println()
 }
 
@@ -584,25 +597,181 @@ func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.String("port", "8080", "Server port")
 	dataDir := fs.String("data-dir", "./data/server", "Storage directory")
+	dbURL := fs.String("db", "", "Database URL: SQLite file path or postgres://user:pass@host:5432/db")
+	fs.StringVar(dbURL, "database-url", "", "Alias for --db")
+	casDirFlag := fs.String("cas-dir", "", "Custom CAS storage path")
 	fs.Parse(args)
 
-	os.MkdirAll(*dataDir, 0755)
-	dbPath := filepath.Join(*dataDir, "openscion.db")
-
-	store, err := cas.NewStore(filepath.Join(*dataDir, "cas"))
-	if err != nil {
-		log.Fatalf("CAS error: %v", err)
+	finalDB := *dbURL
+	if finalDB == "" {
+		finalDB = os.Getenv("DATABASE_URL")
 	}
-	database, err := db.Open(dbPath)
+	if finalDB == "" {
+		_ = os.MkdirAll(*dataDir, 0755)
+		finalDB = filepath.Join(*dataDir, "openscion.db")
+	}
+
+	finalCAS := *casDirFlag
+	if finalCAS == "" {
+		finalCAS = filepath.Join(*dataDir, "cas")
+	}
+	_ = os.MkdirAll(finalCAS, 0755)
+
+	store, err := cas.NewStore(finalCAS)
 	if err != nil {
-		log.Fatalf("Database error: %v", err)
+		log.Fatalf("CAS initialization error: %v", err)
+	}
+
+	database, err := db.Open(finalDB)
+	if err != nil {
+		log.Fatalf("Database connection error: %v", err)
 	}
 	defer database.Close()
 
 	server := api.NewServer(database, store)
-	fmt.Printf("%s%sOpenScion Server Hub listening on http://0.0.0.0:%s%s\n", ui.Bold, ui.BrightCyan, *port, ui.Reset)
-	http.ListenAndServe(":"+*port, server)
+
+	fmt.Println()
+	fmt.Printf("%s%sOpenScion Team Server Hub%s\n", ui.Bold, ui.BrightCyan, ui.Reset)
+	fmt.Println("----------------------------------------------------------------")
+	fmt.Printf("• Server Address:   %shttp://0.0.0.0:%s%s\n", ui.BrightGreen, *port, ui.Reset)
+	if strings.HasPrefix(finalDB, "postgres://") || strings.HasPrefix(finalDB, "postgresql://") {
+		fmt.Printf("• Database Engine:  %sPostgreSQL / CockroachDB Cluster%s\n", ui.BrightPurple, ui.Reset)
+	} else {
+		fmt.Printf("• Database Engine:  %sSQLite WAL (%s)%s\n", ui.Cyan, finalDB, ui.Reset)
+	}
+	fmt.Printf("• CAS Storage:      %s\n", finalCAS)
+	fmt.Println()
+	fmt.Println("Team members can connect with:")
+	fmt.Printf("  %sscion remote add origin http://<this-server-ip>:%s%s\n", ui.BrightCyan, *port, ui.Reset)
+	fmt.Printf("  %sscion push%s   # Push commits\n", ui.Bold, ui.Reset)
+	fmt.Printf("  %sscion pull%s   # Pull commits\n", ui.Bold, ui.Reset)
+	fmt.Println("----------------------------------------------------------------")
+	fmt.Println()
+
+	if err := http.ListenAndServe(":"+*port, server); err != nil {
+		log.Fatalf("Server error: %v", err)
+	}
 }
+
+func cmdRemote(args []string) {
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	if len(args) == 0 || (len(args) == 1 && (args[0] == "-v" || args[0] == "list")) {
+		remote := repo.GetRemote()
+		if remote == "" {
+			fmt.Println("No remotes configured. Add one with:")
+			fmt.Printf("  %sscion remote add origin <server-url>%s\n", ui.Cyan, ui.Reset)
+			return
+		}
+		fmt.Printf("origin  %s (push/pull)\n", remote)
+		return
+	}
+
+	subCmd := args[0]
+	switch subCmd {
+	case "add", "set-url":
+		if len(args) < 2 {
+			ui.PrintError("Usage: scion remote add origin <server-url>")
+			os.Exit(1)
+		}
+		url := args[len(args)-1]
+		if err := repo.SetRemote(url); err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to set remote: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Remote 'origin' set to: %s", url))
+	case "remove", "rm":
+		if err := repo.SetRemote(""); err != nil {
+			ui.PrintError(err.Error())
+			os.Exit(1)
+		}
+		ui.PrintSuccess("Remote 'origin' removed.")
+	default:
+		ui.PrintError(fmt.Sprintf("Unknown remote subcommand %q. Use 'add' or 'set-url'.", subCmd))
+		os.Exit(1)
+	}
+}
+
+func cmdPush(args []string) {
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	remote := repo.GetRemote()
+	if remote == "" {
+		ui.PrintError("No remote server configured.\nRun: scion remote add origin <http://server-address:port>")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pushing to %sorigin%s (%s)...\n", ui.Cyan, ui.Reset, remote)
+	start := time.Now()
+	res, err := repo.Push()
+	if err != nil {
+		ui.PrintError(fmt.Sprintf("Push failed: %v", err))
+		os.Exit(1)
+	}
+
+	if res.PushedChangesets == 0 {
+		ui.PrintSuccess("Everything up-to-date. No new changesets to push.")
+		return
+	}
+
+	elapsed := time.Since(start).Milliseconds()
+	fmt.Printf("  %s✓%s Uploaded %d CAS chunks (%s)\n", ui.BrightGreen, ui.Reset, res.UploadedChunks, ui.FormatBytes(res.UploadedBytes))
+	fmt.Printf("  %s✓%s Pushed %d changesets into remote merge queue\n", ui.BrightGreen, ui.Reset, res.PushedChangesets)
+	fmt.Printf("  %s✓%s Landed at linear sequence %s#%d%s: %q (%dms)\n",
+		ui.BrightGreen, ui.Reset, ui.BrightYellow+ui.Bold, res.RemoteSequence, ui.Reset, res.Message, elapsed)
+}
+
+func cmdPull(args []string) {
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	remote := repo.GetRemote()
+	if remote == "" {
+		ui.PrintError("No remote server configured.\nRun: scion remote add origin <http://server-address:port>")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pulling from %sorigin%s (%s)...\n", ui.Cyan, ui.Reset, remote)
+	start := time.Now()
+	res, err := repo.Pull()
+	if err != nil {
+		ui.PrintError(fmt.Sprintf("Pull failed: %v", err))
+		os.Exit(1)
+	}
+
+	if res.PulledChangesets == 0 {
+		ui.PrintSuccess(fmt.Sprintf("Already up-to-date at sequence #%d.", res.NewSequence))
+		return
+	}
+
+	elapsed := time.Since(start).Milliseconds()
+	fmt.Printf("  %s✓%s Downloaded %d changesets and %d CAS chunks (%s)\n",
+		ui.BrightGreen, ui.Reset, res.PulledChangesets, res.DownloadedChunks, ui.FormatBytes(res.DownloadedBytes))
+	fmt.Printf("  %s✓%s Materialized %d updated files in workspace\n", ui.BrightGreen, ui.Reset, res.UpdatedFiles)
+	fmt.Printf("  %s✓%s Fast-forwarded to sequence %s#%d%s (%dms)\n",
+		ui.BrightGreen, ui.Reset, ui.BrightYellow+ui.Bold, res.NewSequence, ui.Reset, elapsed)
+}
+
+func cmdSync(args []string) {
+	fmt.Printf("\n%sSynchronizing with origin...%s\n", ui.Bold+ui.Cyan, ui.Reset)
+	cmdPull(args)
+	cmdPush(args)
+}
+
 
 func splitLines(s string) []string {
 	if s == "" {

@@ -11,6 +11,7 @@ import (
 	"github.com/aether/scn/pkg/graph"
 	"github.com/aether/scn/pkg/tree"
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
 
@@ -37,26 +38,84 @@ type SparseProfile struct {
 }
 
 type DB struct {
-	sqlDB *sql.DB
-	mu    sync.Mutex
+	sqlDB      *sql.DB
+	isPostgres bool
+	mu         sync.Mutex
 }
 
-// Open initializes the database connection and runs schema migrations
+// Open initializes the database connection (SQLite or PostgreSQL / CockroachDB)
 func Open(dataSource string) (*DB, error) {
-	sqlDB, err := sql.Open("sqlite", dataSource)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+	var sqlDB *sql.DB
+	var isPostgres bool
+	var err error
+
+	if strings.HasPrefix(dataSource, "postgres://") || strings.HasPrefix(dataSource, "postgresql://") {
+		isPostgres = true
+		sqlDB, err = sql.Open("postgres", dataSource)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to PostgreSQL/CockroachDB: %w", err)
+		}
+		sqlDB.SetMaxOpenConns(50)
+		sqlDB.SetMaxIdleConns(25)
+	} else {
+		sqlDB, err = sql.Open("sqlite", dataSource)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database: %w", err)
+		}
+		sqlDB.SetMaxOpenConns(25)
+		sqlDB.SetMaxIdleConns(25)
 	}
 
-	// Optimize SQLite settings for high concurrency
-	sqlDB.SetMaxOpenConns(25)
-	sqlDB.SetMaxIdleConns(25)
-
-	d := &DB{sqlDB: sqlDB}
+	d := &DB{
+		sqlDB:      sqlDB,
+		isPostgres: isPostgres,
+	}
 	if err := d.initSchema(); err != nil {
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 	return d, nil
+}
+
+func (d *DB) rebind(query string) string {
+	if !d.isPostgres {
+		return query
+	}
+
+	// Handle SQLite specific syntax conversion
+	query = strings.ReplaceAll(query, "INSERT OR IGNORE INTO trees (hash, data) VALUES (?, ?)", "INSERT INTO trees (hash, data) VALUES (?, ?) ON CONFLICT (hash) DO NOTHING")
+	query = strings.ReplaceAll(query, "INSERT OR REPLACE INTO trees (hash, data) VALUES (?, ?)", "INSERT INTO trees (hash, data) VALUES (?, ?) ON CONFLICT (hash) DO UPDATE SET data = EXCLUDED.data")
+	query = strings.ReplaceAll(query, "INSERT OR REPLACE INTO changesets (", "INSERT INTO changesets (")
+	if strings.Contains(query, "INSERT INTO changesets (") && !strings.Contains(query, "ON CONFLICT") {
+		query += " ON CONFLICT (id) DO UPDATE SET sequence_number = EXCLUDED.sequence_number, root_tree_hash = EXCLUDED.root_tree_hash"
+	}
+
+	var b strings.Builder
+	paramIdx := 1
+	for _, ch := range query {
+		if ch == '?' {
+			b.WriteString(fmt.Sprintf("$%d", paramIdx))
+			paramIdx++
+		} else {
+			b.WriteRune(ch)
+		}
+	}
+	return b.String()
+}
+
+func (d *DB) exec(query string, args ...any) (sql.Result, error) {
+	return d.sqlDB.Exec(d.rebind(query), args...)
+}
+
+func (d *DB) queryRow(query string, args ...any) *sql.Row {
+	return d.sqlDB.QueryRow(d.rebind(query), args...)
+}
+
+func (d *DB) query(query string, args ...any) (*sql.Rows, error) {
+	return d.sqlDB.Query(d.rebind(query), args...)
+}
+
+func (d *DB) execTx(tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	return tx.Exec(d.rebind(query), args...)
 }
 
 func (d *DB) Close() error {
@@ -117,12 +176,16 @@ func (d *DB) initSchema() error {
 	}
 
 	for _, q := range queries {
-		if _, err := d.sqlDB.Exec(q); err != nil {
+		if d.isPostgres && strings.HasPrefix(q, "PRAGMA") {
+			continue
+		}
+		if _, err := d.sqlDB.Exec(d.rebind(q)); err != nil {
 			return fmt.Errorf("error executing %q: %w", q, err)
 		}
 	}
 	return nil
 }
+
 
 // CreateRepo creates a new repository and initial empty main branch
 func (d *DB) CreateRepo(name string) (*Repository, error) {
@@ -138,7 +201,7 @@ func (d *DB) CreateRepo(name string) (*Repository, error) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec(`INSERT INTO repositories (id, name, created_at) VALUES (?, ?, ?)`,
+	_, err = d.execTx(tx, `INSERT INTO repositories (id, name, created_at) VALUES (?, ?, ?)`,
 		repoID, name, now)
 	if err != nil {
 		return nil, fmt.Errorf("repo %q already exists or error: %w", name, err)
@@ -151,7 +214,7 @@ func (d *DB) CreateRepo(name string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = tx.Exec(`INSERT OR IGNORE INTO trees (hash, data) VALUES (?, ?)`, emptyTreeHash, string(data))
+	_, err = d.execTx(tx, `INSERT OR IGNORE INTO trees (hash, data) VALUES (?, ?)`, emptyTreeHash, string(data))
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +232,7 @@ func (d *DB) CreateRepo(name string) (*Repository, error) {
 	)
 	initialCS.SequenceNumber = 1
 
-	_, err = tx.Exec(`INSERT INTO changesets (
+	_, err = d.execTx(tx, `INSERT INTO changesets (
 		id, repo_id, sequence_number, root_tree_hash, parent_ids,
 		author, message, agent_model, session_id, task_trace_id, created_at
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -180,7 +243,7 @@ func (d *DB) CreateRepo(name string) (*Repository, error) {
 	}
 
 	// Set main branch
-	_, err = tx.Exec(`INSERT INTO branches (repo_id, name, head_changeset_id, sequence_number, updated_at)
+	_, err = d.execTx(tx, `INSERT INTO branches (repo_id, name, head_changeset_id, sequence_number, updated_at)
 		VALUES (?, 'main', ?, 1, ?)`,
 		repoID, initialCS.ID, now)
 	if err != nil {
@@ -199,7 +262,7 @@ func (d *DB) CreateRepo(name string) (*Repository, error) {
 }
 
 func (d *DB) GetRepo(name string) (*Repository, error) {
-	row := d.sqlDB.QueryRow(`SELECT id, name, created_at FROM repositories WHERE name = ? OR id = ?`, name, name)
+	row := d.queryRow(`SELECT id, name, created_at FROM repositories WHERE name = ? OR id = ?`, name, name)
 	var r Repository
 	if err := row.Scan(&r.ID, &r.Name, &r.CreatedAt); err != nil {
 		return nil, fmt.Errorf("repository %q not found: %w", name, err)
@@ -208,7 +271,7 @@ func (d *DB) GetRepo(name string) (*Repository, error) {
 }
 
 func (d *DB) ListRepos() ([]Repository, error) {
-	rows, err := d.sqlDB.Query(`SELECT id, name, created_at FROM repositories ORDER BY created_at DESC`)
+	rows, err := d.query(`SELECT id, name, created_at FROM repositories ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +289,7 @@ func (d *DB) ListRepos() ([]Repository, error) {
 }
 
 func (d *DB) GetBranch(repoID, branchName string) (*Branch, error) {
-	row := d.sqlDB.QueryRow(`SELECT repo_id, name, head_changeset_id, sequence_number, updated_at
+	row := d.queryRow(`SELECT repo_id, name, head_changeset_id, sequence_number, updated_at
 		FROM branches WHERE repo_id = ? AND name = ?`, repoID, branchName)
 	var b Branch
 	if err := row.Scan(&b.RepoID, &b.Name, &b.HeadID, &b.SequenceNumber, &b.UpdatedAt); err != nil {
@@ -237,7 +300,7 @@ func (d *DB) GetBranch(repoID, branchName string) (*Branch, error) {
 
 func (d *DB) UpdateBranchTip(repoID, branchName, newHeadID string, newSeq int64) error {
 	now := time.Now().Unix()
-	_, err := d.sqlDB.Exec(`UPDATE branches SET head_changeset_id = ?, sequence_number = ?, updated_at = ?
+	_, err := d.exec(`UPDATE branches SET head_changeset_id = ?, sequence_number = ?, updated_at = ?
 		WHERE repo_id = ? AND name = ?`, newHeadID, newSeq, now, repoID, branchName)
 	return err
 }
@@ -247,12 +310,12 @@ func (d *DB) SaveTree(t *tree.Tree) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.sqlDB.Exec(`INSERT OR REPLACE INTO trees (hash, data) VALUES (?, ?)`, t.RootHash, string(data))
+	_, err = d.exec(`INSERT OR REPLACE INTO trees (hash, data) VALUES (?, ?)`, t.RootHash, string(data))
 	return err
 }
 
 func (d *DB) GetTree(hash string) (*tree.Tree, error) {
-	row := d.sqlDB.QueryRow(`SELECT data FROM trees WHERE hash = ?`, hash)
+	row := d.queryRow(`SELECT data FROM trees WHERE hash = ?`, hash)
 	var raw string
 	if err := row.Scan(&raw); err != nil {
 		return nil, fmt.Errorf("tree hash %s not found: %w", hash, err)
@@ -262,7 +325,7 @@ func (d *DB) GetTree(hash string) (*tree.Tree, error) {
 
 func (d *DB) SaveChangeset(cs *graph.Changeset) error {
 	parentIDsStr := strings.Join(cs.ParentIDs, ",")
-	_, err := d.sqlDB.Exec(`INSERT OR REPLACE INTO changesets (
+	_, err := d.exec(`INSERT OR REPLACE INTO changesets (
 		id, repo_id, sequence_number, root_tree_hash, parent_ids,
 		author, message, agent_model, session_id, task_trace_id, created_at
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -272,7 +335,7 @@ func (d *DB) SaveChangeset(cs *graph.Changeset) error {
 }
 
 func (d *DB) GetChangeset(id string) (*graph.Changeset, error) {
-	row := d.sqlDB.QueryRow(`SELECT id, repo_id, sequence_number, root_tree_hash, parent_ids,
+	row := d.queryRow(`SELECT id, repo_id, sequence_number, root_tree_hash, parent_ids,
 		author, message, agent_model, session_id, task_trace_id, created_at
 		FROM changesets WHERE id = ? OR id LIKE ?`, id, id+"%")
 
@@ -306,7 +369,7 @@ func (d *DB) GetChangeset(id string) (*graph.Changeset, error) {
 }
 
 func (d *DB) GetChangesetBySequence(repoID string, seq int64) (*graph.Changeset, error) {
-	row := d.sqlDB.QueryRow(`SELECT id, repo_id, sequence_number, root_tree_hash, parent_ids,
+	row := d.queryRow(`SELECT id, repo_id, sequence_number, root_tree_hash, parent_ids,
 		author, message, agent_model, session_id, task_trace_id, created_at
 		FROM changesets WHERE repo_id = ? AND sequence_number = ? LIMIT 1`, repoID, seq)
 
@@ -344,7 +407,7 @@ func (d *DB) GetChangesetsByRepo(repoID string, limit int) ([]graph.Changeset, e
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := d.sqlDB.Query(`SELECT id, repo_id, sequence_number, root_tree_hash, parent_ids,
+	rows, err := d.query(`SELECT id, repo_id, sequence_number, root_tree_hash, parent_ids,
 		author, message, agent_model, session_id, task_trace_id, created_at
 		FROM changesets WHERE repo_id = ? ORDER BY sequence_number DESC, created_at DESC LIMIT ?`, repoID, limit)
 	if err != nil {
@@ -390,13 +453,13 @@ func (d *DB) SaveSparseProfile(profile *SparseProfile) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.sqlDB.Exec(`INSERT OR REPLACE INTO sparse_profiles (id, repo_id, name, included_patterns, created_at)
+	_, err = d.exec(`INSERT OR REPLACE INTO sparse_profiles (id, repo_id, name, included_patterns, created_at)
 		VALUES (?, ?, ?, ?, ?)`, profile.ID, profile.RepoID, profile.Name, string(data), profile.CreatedAt)
 	return err
 }
 
 func (d *DB) GetSparseProfiles(repoID string) ([]SparseProfile, error) {
-	rows, err := d.sqlDB.Query(`SELECT id, repo_id, name, included_patterns, created_at FROM sparse_profiles WHERE repo_id = ?`, repoID)
+	rows, err := d.query(`SELECT id, repo_id, name, included_patterns, created_at FROM sparse_profiles WHERE repo_id = ?`, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -414,3 +477,4 @@ func (d *DB) GetSparseProfiles(repoID string) ([]SparseProfile, error) {
 	}
 	return profiles, nil
 }
+

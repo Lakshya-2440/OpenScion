@@ -94,7 +94,43 @@ scion show #1
 
 ---
 
-## 3. Command Reference
+## 3. Team Collaboration & Remote Server
+
+When multiple developers or AI agents want to share code, any machine can become the team server with 1 command.
+
+### Start Team Server
+```bash
+# Option A: Built-in zero-config SQLite server (fast, local/network):
+scion serve --port 8080
+
+# Option B: Connected to cloud PostgreSQL / CockroachDB cluster:
+scion serve --port 8080 --db "postgres://user:password@host:5432/dbname"
+```
+
+### Connect Team Members
+```bash
+# Connect local repo to the team server:
+scion remote add origin http://<server-ip>:8080
+
+# View remotes:
+scion remote -v
+```
+
+### Push & Pull Commits
+```bash
+# Push local commits to the server's linear merge queue:
+scion push
+
+# Pull teammate commits and update working files:
+scion pull
+
+# One-step sync (pull + push):
+scion sync
+```
+
+---
+
+## 4. Command Reference
 
 | Command | Description |
 | :--- | :--- |
@@ -106,8 +142,13 @@ scion show #1
 | `scion blame <path>` | Line-by-line blame with sequence numbers and authors. |
 | `scion show [commit-id\|#seq]` | Display commit details, tree hashes, and file lists. |
 | `scion mount [dir] [--rev #seq]` | Mount virtual ghost filesystem (zero bytes on disk, lazy-hydrated on read). |
+| `scion remote [add\|rm] <url>` | Configure team origin remote server. |
+| `scion push` | Submit local changesets to remote speculative rebase queue. |
+| `scion pull` | Fast-forward and materialize remote changesets into workspace. |
+| `scion sync` | Synchronize bidirectionally (pull then push) with remote server. |
 | `scion clone <src> [dir]` | Fast sparse clone from local path or remote repository. |
-| `scion serve [--port 8080]` | Optional: launch central hub server for multi-agent network teams. |
+| `scion serve [--port] [--db]` | Launch team hub server (supports SQLite & PostgreSQL/CockroachDB). |
+
 
 ---
 

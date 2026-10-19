@@ -189,7 +189,7 @@ func MatchesAnyPattern(path string, patterns []string) bool {
 // LoadIgnorePatterns loads ignore rules from .gitignore, .scionignore, and default directories
 func LoadIgnorePatterns(rootPath string) []string {
 	patterns := []string{
-		".scion/**", ".scn/**", ".git/**", "node_modules/**", "web/node_modules/**",
+		".scion/**", ".scn/**", ".git/**", "mnt/**", "mnt", "node_modules/**", "web/node_modules/**",
 		"dist/**", "web/dist/**", "bin/**", "data/**", "*.db", "*.db-wal", "*.db-shm",
 		"*.chunk", ".DS_Store", "Thumbs.db", "web/.vercel/**", ".vercel/**",
 	}
@@ -225,12 +225,19 @@ func BuildTreeFromDir(rootPath string, store *cas.Store, ignorePatterns []string
 
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			return nil
+		}
+
+		if info != nil && info.IsDir() {
+			name := info.Name()
+			if name == "mnt" || name == ".scion" || name == ".scn" || name == ".git" || name == "node_modules" || name == ".vercel" {
+				return filepath.SkipDir
+			}
 		}
 
 		relPath, err := filepath.Rel(rootPath, path)
 		if err != nil {
-			return err
+			return nil
 		}
 		if relPath == "." {
 			return nil

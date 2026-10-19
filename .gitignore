@@ -1,0 +1,32 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Storage and databases
+data/
+*.db
+*.db-wal
+*.db-shm
+*.chunk
+
+# Node / Web dependencies & build artifacts
+node_modules/
+web/node_modules/
+web/dist/
+dist/
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.log
+
+# Workspace demo directories
+/tmp/aether-demo/

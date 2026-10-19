@@ -161,7 +161,7 @@ func (d *DB) CreateRepo(name string) (*Repository, error) {
 		repoID,
 		emptyTreeHash,
 		[]string{},
-		"System <system@aether.local>",
+		"OpenScion System <system@openscion.local>",
 		"Initial empty repository commit",
 		"system",
 		"",

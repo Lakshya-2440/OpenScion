@@ -186,9 +186,42 @@ func MatchesAnyPattern(path string, patterns []string) bool {
 	return false
 }
 
+// LoadIgnorePatterns loads ignore rules from .gitignore, .scionignore, and default directories
+func LoadIgnorePatterns(rootPath string) []string {
+	patterns := []string{
+		".scion/**", ".scn/**", ".git/**", "node_modules/**", "web/node_modules/**",
+		"dist/**", "web/dist/**", "bin/**", "data/**", "*.db", "*.db-wal", "*.db-shm",
+		"*.chunk", ".DS_Store", "Thumbs.db", "web/.vercel/**", ".vercel/**",
+	}
+
+	for _, name := range []string{".gitignore", ".scionignore"} {
+		fpath := filepath.Join(rootPath, name)
+		data, err := os.ReadFile(fpath)
+		if err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				line = strings.TrimPrefix(line, "/")
+				if strings.HasSuffix(line, "/") {
+					patterns = append(patterns, line+"**")
+				} else {
+					patterns = append(patterns, line)
+					patterns = append(patterns, line+"/**")
+				}
+			}
+		}
+	}
+	return patterns
+}
+
 // BuildTreeFromDir scans working dir, puts blobs into CAS store, and returns constructed Tree
 func BuildTreeFromDir(rootPath string, store *cas.Store, ignorePatterns []string) (*Tree, error) {
 	t := NewTree()
+	if len(ignorePatterns) == 0 {
+		ignorePatterns = LoadIgnorePatterns(rootPath)
+	}
 
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -203,15 +236,12 @@ func BuildTreeFromDir(rootPath string, store *cas.Store, ignorePatterns []string
 			return nil
 		}
 
-		// Always ignore internal .scion, .scn, .git, and common temp folders
-		parts := strings.Split(relPath, string(os.PathSeparator))
-		for _, part := range parts {
-			if part == ".scion" || part == ".scn" || part == ".git" || part == "node_modules" || part == "target" || part == "dist" || part == "bin" {
-				if info.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
+		normalizedRel := filepath.ToSlash(relPath)
+		if MatchesAnyPattern(normalizedRel, ignorePatterns) || MatchesAnyPattern(info.Name(), ignorePatterns) {
+			if info.IsDir() {
+				return filepath.SkipDir
 			}
+			return nil
 		}
 
 		if info.IsDir() {
@@ -233,8 +263,6 @@ func BuildTreeFromDir(rootPath string, store *cas.Store, ignorePatterns []string
 			mode = 0755
 		}
 
-		// Normalize path separators to forward slash
-		normalizedRel := filepath.ToSlash(relPath)
 		t.Entries[normalizedRel] = Entry{
 			Path: normalizedRel,
 			Type: TypeBlob,

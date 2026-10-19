@@ -6,6 +6,8 @@ bin/
 *.dylib
 
 # Storage and databases
+.scion/
+.scn/
 data/
 *.db
 *.db-wal

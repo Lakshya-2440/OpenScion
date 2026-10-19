@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-echo -e "\033[1;36m[Aether] Building binaries for darwin/arm64...\033[0m"
+echo -e "\033[1;36m[OpenScion] Building binaries for darwin/arm64...\033[0m"
 mkdir -p bin
 
 go build -ldflags="-s -w" -o bin/aether-server ./cmd/aether-server

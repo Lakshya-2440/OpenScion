@@ -3,11 +3,11 @@ set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$DIR/bin"
-DEMO_DIR="/tmp/aether-demo"
+DEMO_DIR="/tmp/openscion-demo"
 PORT="8089"
 
 echo -e "\033[1;35m========================================================================\033[0m"
-echo -e "\033[1;36m       PROJECT AETHER: AGENT-SCALE VCS (SCION CLASS) DEMO               \033[0m"
+echo -e "\033[1;36m       PROJECT OPENSCION: AGENT-SCALE VCS (ANTHROPIC CLASS) DEMO        \033[0m"
 echo -e "\033[1;35m========================================================================\033[0m"
 
 # Ensure binaries are built
@@ -20,7 +20,7 @@ rm -rf "$DEMO_DIR"
 mkdir -p "$DEMO_DIR/server-data"
 mkdir -p "$DEMO_DIR/workspace-main"
 
-echo -e "\n\033[1;33m[Step 1] Starting Aether Control Plane Server on port $PORT...\033[0m"
+echo -e "\n\033[1;33m[Step 1] Starting OpenScion Control Plane Server on port $PORT...\033[0m"
 "$BIN/aether-server" --port "$PORT" --data-dir "$DEMO_DIR/server-data" > "$DEMO_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
@@ -35,11 +35,12 @@ sleep 1
 curl -s "http://localhost:$PORT/healthz" > /dev/null || (echo "Server failed to start"; cat "$DEMO_DIR/server.log"; exit 1)
 echo -e "\033[1;32m✔ Control Plane online and healthy\033[0m"
 
+export OPENSCION_SERVER_URL="http://localhost:$PORT"
 export AETHER_SERVER_URL="http://localhost:$PORT"
 
 echo -e "\n\033[1;33m[Step 2] Initializing repository in workspace-main...\033[0m"
 cd "$DEMO_DIR/workspace-main"
-"$BIN/scn" init aether-monorepo
+"$BIN/scn" init openscion-monorepo
 
 echo -e "\n\033[1;33m[Step 3] Adding source files for auth, payments, and config...\033[0m"
 mkdir -p services/auth services/payments config
@@ -94,7 +95,7 @@ echo -e "\n\033[1;33m[Step 6] Submitting to linear merge queue...\033[0m"
 
 echo -e "\n\033[1;33m[Step 7] Testing SUB-SECOND Sparse Clone for an Autonomous Agent pod...\033[0m"
 cd "$DEMO_DIR"
-"$BIN/scn" clone aether-monorepo workspace-agent --sparse "services/auth/**"
+"$BIN/scn" clone openscion-monorepo workspace-agent --sparse "services/auth/**"
 
 echo -e "\n\033[1;36mSparse directory layout inside agent pod:\033[0m"
 ls -la workspace-agent/services/

@@ -33,7 +33,7 @@ func main() {
 		log.Fatalf("Failed to initialize CAS store: %v", err)
 	}
 
-	fmt.Printf("%s%s[scnd] Aether Local Agent Daemon Active%s\n", ui.Bold, ui.BrightCyan, ui.Reset)
+	fmt.Printf("%s%s[scnd] OpenScion Local Agent Daemon Active%s\n", ui.Bold, ui.BrightCyan, ui.Reset)
 	fmt.Printf("   ├─ Cache Path: %s\n", *cacheDir)
 	fmt.Printf("   ├─ Port:       %s\n", *port)
 	fmt.Printf("   └─ Status:     %sListening for sparse pre-warms & background CAS chunking%s\n\n", ui.BrightGreen, ui.Reset)

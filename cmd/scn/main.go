@@ -73,7 +73,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Printf("%s%sscn - Agent-Scale Version Control System (Anthropic Scion Class)%s\n\n", ui.Bold, ui.BrightCyan, ui.Reset)
+	fmt.Printf("%s%sscn - OpenScion: Agent-Scale Version Control System (Anthropic Class)%s\n\n", ui.Bold, ui.BrightCyan, ui.Reset)
 	fmt.Println("Usage: scn <command> [options]")
 	fmt.Println()
 	fmt.Println("Core Commands:")
@@ -99,6 +99,9 @@ func printUsage() {
 }
 
 func getServerURL() string {
+	if s := os.Getenv("OPENSCION_SERVER_URL"); s != "" {
+		return s
+	}
 	if s := os.Getenv("AETHER_SERVER_URL"); s != "" {
 		return s
 	}
@@ -111,13 +114,13 @@ func cmdInit(args []string) {
 	agentFlag := fs.String("agent", "claude-code-3.7-sonnet", "Agent model identifier")
 	fs.Parse(args)
 
-	repoName := "aether-repo"
+	repoName := "openscion-repo"
 	if len(fs.Args()) > 0 {
 		repoName = fs.Args()[0]
 	}
 
 	cli := client.NewClient(*serverFlag)
-	ui.PrintInfo(fmt.Sprintf("Connecting to Aether control plane at %s...", *serverFlag))
+	ui.PrintInfo(fmt.Sprintf("Connecting to OpenScion control plane at %s...", *serverFlag))
 
 	// Get or create repo on server
 	repoInfo, err := cli.GetRepoInfo(repoName)
@@ -179,8 +182,8 @@ func cmdInit(args []string) {
 	}
 	saveManifest(&manifest)
 
-	ui.PrintSuccess(fmt.Sprintf("Initialized empty Aether workspace for %q", repoName))
-	ui.PrintBox("Workspace Configured", []string{
+	ui.PrintSuccess(fmt.Sprintf("Initialized empty OpenScion workspace for %q", repoName))
+	ui.PrintBox("OpenScion: Workspace Configured", []string{
 		fmt.Sprintf("Repository:     %s", repoName),
 		fmt.Sprintf("Branch:         main (Sequence #%d)", seq),
 		fmt.Sprintf("Server URL:     %s", *serverFlag),
@@ -330,7 +333,7 @@ func cmdStatus(args []string) {
 	}
 	lines = append(lines, changesLines...)
 
-	ui.PrintBox("scn: workspace status", lines)
+	ui.PrintBox("OpenScion: Workspace Status", lines)
 }
 
 func cmdDiff(args []string) {
@@ -650,7 +653,7 @@ func cmdProfile(args []string) {
 func mustLoadWorkspace() (*Config, *Manifest) {
 	cfgData, err := os.ReadFile(filepath.Join(".scn", "config.json"))
 	if err != nil {
-		ui.PrintError("Not an Aether workspace (no .scn/config.json found). Run 'scn init' or 'scn clone'.")
+		ui.PrintError("Not an OpenScion workspace (no .scn/config.json found). Run 'scn init' or 'scn clone'.")
 		os.Exit(1)
 	}
 	var cfg Config

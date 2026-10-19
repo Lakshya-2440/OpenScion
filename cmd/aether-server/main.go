@@ -56,7 +56,7 @@ func main() {
 	// Create and start API Server
 	server := api.NewServer(database, store)
 	addr := ":" + *port
-	log.Printf("[AETHER] Control plane listening on http://0.0.0.0%s\n", addr)
+	log.Printf("[OPENSCION] Control plane listening on http://0.0.0.0%s\n", addr)
 	if err := http.ListenAndServe(addr, server); err != nil {
 		log.Fatalf("Server exited with error: %v", err)
 	}
@@ -64,15 +64,15 @@ func main() {
 
 func printBanner(port, dataDir, dbPath string) {
 	fmt.Println("\033[38;5;39m")
-	fmt.Println("  █████╗ ███████╗████████╗██╗  ██╗███████╗██████╗ ")
-	fmt.Println(" ██╔══██╗██╔════╝╚══██╔══╝██║  ██║██╔════╝██╔══██╗")
-	fmt.Println(" ███████║█████╗     ██║   ███████║█████╗  ██████╔╝")
-	fmt.Println(" ██╔══██║██╔══╝     ██║   ██╔══██║██╔══╝  ██╔══██╗")
-	fmt.Println(" ██║  ██║███████╗   ██║   ██║  ██║███████╗██║  ██║")
-	fmt.Println(" ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝")
-	fmt.Println("   Agent-Scale Server-Centric Version Control   ")
+	fmt.Println("  ██████╗ ██████╗ ███████╗███╗   ██╗███████╗ ██████╗██╗ ██████╗ ███╗   ██╗")
+	fmt.Println(" ██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔════╝██╔════╝██║██╔═══██╗████╗  ██║")
+	fmt.Println(" ██║   ██║██████╔╝█████╗  ██╔██╗ ██║███████╗██║     ██║██║   ██║██╔██╗ ██║")
+	fmt.Println(" ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║╚════██║██║     ██║██║   ██║██║╚██╗██║")
+	fmt.Println(" ╚██████╔╝██║     ███████╗██║ ╚████║███████║╚██████╗██║╚██████╔╝██║ ╚████║")
+	fmt.Println("  ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚══════╝ ╚═════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝")
+	fmt.Println("    OpenScion: Agent-Scale Server-Centric Version Control (Anthropic Class) ")
 	fmt.Println("\033[0m")
-	fmt.Printf("\033[1;32m ✔ Control Plane Ready\033[0m\n")
+	fmt.Printf("\033[1;32m ✔ OpenScion Control Plane Ready\033[0m\n")
 	fmt.Printf("   ├─ Port:        \033[1;36m%s\033[0m\n", port)
 	fmt.Printf("   ├─ Data Dir:    %s\n", dataDir)
 	fmt.Printf("   ├─ Database:    %s\n", dbPath)

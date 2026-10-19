@@ -1,31 +1,25 @@
-.PHONY: all build server scn scnd web demo test deploy-render deploy-vercel clean
+.PHONY: all build install server web demo clean
 
-all: build web-build
+all: build install
 
 build:
 	@mkdir -p bin
+	go build -ldflags="-s -w" -o bin/scion ./cmd/scion
 	go build -ldflags="-s -w" -o bin/aether-server ./cmd/aether-server
-	go build -ldflags="-s -w" -o bin/scn ./cmd/scn
 	go build -ldflags="-s -w" -o bin/scnd ./cmd/scnd
-	@echo "\033[1;32m✔ Built all binaries into ./bin\033[0m"
+	@echo "\033[1;32m✔ Built OpenScion binaries into ./bin\033[0m"
+
+install: build
+	@mkdir -p ~/.local/bin
+	@cp bin/scion ~/.local/bin/scion
+	@cp bin/scion ~/.local/bin/scn
+	@echo "\033[1;32m✔ Installed 'scion' to ~/.local/bin/scion (available globally in your terminal!)\033[0m"
 
 server:
 	./bin/aether-server --port 8080 --data-dir ./data/server
 
-web:
-	cd web && npm run dev
-
-web-build:
-	cd web && npm run build
-
 demo:
 	./scripts/demo.sh
 
-deploy-render:
-	./scripts/deploy-render.sh
-
-deploy-vercel:
-	./scripts/deploy-vercel.sh
-
 clean:
-	rm -rf bin/ dist/ data/ /tmp/aether-demo web/dist
+	rm -rf bin/ dist/ data/ /tmp/openscion-demo /tmp/test-scion-terminal

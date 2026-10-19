@@ -203,10 +203,10 @@ func BuildTreeFromDir(rootPath string, store *cas.Store, ignorePatterns []string
 			return nil
 		}
 
-		// Always ignore internal .scn, .git, and common temp folders
+		// Always ignore internal .scion, .scn, .git, and common temp folders
 		parts := strings.Split(relPath, string(os.PathSeparator))
 		for _, part := range parts {
-			if part == ".scn" || part == ".git" || part == "node_modules" || part == "target" || part == "dist" || part == "bin" {
+			if part == ".scion" || part == ".scn" || part == ".git" || part == "node_modules" || part == "target" || part == "dist" || part == "bin" {
 				if info.IsDir() {
 					return filepath.SkipDir
 				}

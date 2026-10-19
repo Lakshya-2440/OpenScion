@@ -1,135 +1,106 @@
-# Project Aether: Agent-Scale Version Control System (Anthropic Scion Class)
+# OpenScion — Agent-Scale Terminal Version Control System
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
-[![VCS Architecture](https://img.shields.io/badge/architecture-server--centric%20merkle%20cas-blue)](#)
-[![Throughput](https://img.shields.io/badge/daily%20merges-50%2C000%2B-purple)](#)
-[![Latency](https://img.shields.io/badge/landing%20p99-%3C350ms-emerald)](#)
+[![Go Version](https://img.shields.io/badge/go-1.24%2B-blue)](#)
+[![VCS Architecture](https://img.shields.io/badge/architecture-embedded%20merkle%20cas-emerald)](#)
+[![CLI Tool](https://img.shields.io/badge/cli-scion-purple)](#)
+[![Throughput](https://img.shields.io/badge/throughput-sub--second%20landing-brightgreen)](#)
 
-A complete, production-grade implementation of an agent-scale version control system inspired by Anthropic's **Scion** and Google's **Piper** / Meta's **Sapling**. Designed for organizations where autonomous AI coding agents (Claude Code, SWE-agents, Copilots) generate thousands of changes per hour, making traditional decentralized Git impractical.
+A standalone, high-performance terminal version control system built from the ground up for developer and AI-agent workflows. Inspired by Anthropic's internal **Scion** VCS and Google's **Piper** / Meta's **Sapling**.
 
----
-
-## 1. System Overview
-
-```
-                      ┌──────────────────────────────────────┐
-                      │    Autonomous AI Agents / CI Nodes   │
-                      └──────────────────┬───────────────────┘
-                                         │
-                   ┌─────────────────────┴─────────────────────┐
-                   │                                           │
-             (CLI Tool)                                   (Direct API)
-                 scn                                   Zero-Clone Queries
-                   │                                           │
-            ┌──────┴──────┐                                    │
-            │ scnd daemon │                                    │
-            └──────┬──────┘                                    │
-                   │                                           │
-                   ▼                                           ▼
-       ┌───────────────────────────────────────────────────────────────┐
-       │             AETHER CONTROL PLANE (aether-server)              │
-       │                                                               │
-       │  ┌─────────────────────────┐   ┌───────────────────────────┐  │
-       │  │ FastCDC Content Storage │   │ Continuous Speculative    │  │
-       │  │ (CAS Blobs & Merkle)    │   │ Linear Merge Queue (WAL)  │  │
-       │  └────────────┬────────────┘   └─────────────┬─────────────┘  │
-       └───────────────┼──────────────────────────────┼────────────────┘
-                       │                              │
-                       ▼                              ▼
-            ┌────────────────────┐         ┌────────────────────┐
-            │ Object Store (CAS) │         │ SQLite / Postgres  │
-            │ NVMe / MinIO / S3  │         │ (Metadata Graph)   │
-            └────────────────────┘         └────────────────────┘
-```
-
-### Core Innovations
-* **Always-Online Assumption:** Discards heavy offline git cloning. Ephemeral agent containers check out in **< 2 seconds** using sparse profiles.
-* **Lock-Free Linear Merge Queue:** Replaces ref locks with speculative server-side 3-way rebase pipelines, landing commits in milliseconds.
-* **Agent Provenance Trace:** Every commit captures AI model name (`claude-code-3.7-sonnet`), session ID, and prompt trace directly in the changeset DAG.
-* **Zero-Clone Server Queries:** Query file slices, AST diffs, and line-level blame via remote HTTP API without cloning the repository.
-* **Antique Web Platform:** Modern web console for visualizing linear timeline, merge queue depth, and side-by-side diffs.
+Works **directly in the terminal like `git`** with zero external servers or background daemons required for local repositories.
 
 ---
 
-## 2. Quickstart
+## 1. Installation
 
-### Build All Binaries
+Run `make install` to compile and install `scion` into your PATH:
+
 ```bash
-make build
-# Or directly:
-./scripts/install.sh
+make install
 ```
-This produces three static binaries in `./bin/`:
-1. `bin/aether-server` — Centralized Control Plane & CAS Server.
-2. `bin/scn` — High-performance Client CLI with ANSI status cards.
-3. `bin/scnd` — Local caching daemon for ephemeral agent pods.
+This builds and installs `scion` directly to `~/.local/bin/scion` (and alias `scn`).
 
-### Run Automated End-to-End Simulation
-To watch the full system in action (starts server, initializes repo, creates commits, runs sub-second sparse clone, executes concurrent agent edit, lands through speculative rebase, and prints graph log):
+Verify installation:
 ```bash
-make demo
+scion --help
 ```
 
 ---
 
-## 3. CLI Commands (`scn`)
+## 2. Using `scion` (Git-like Terminal Workflow)
+
+### Initialize a Repository
+```bash
+# In any project directory:
+scion init my-project
+```
+Creates a `.scion/` directory containing embedded Merkle Content Addressable Storage (CAS) and an ACID SQLite metadata DAG.
+
+### Check Status
+```bash
+scion status
+```
+Outputs an ANSI terminal card showing modified, added, and deleted files alongside linear sequence numbers and AI agent runtime context.
+
+### View Colorized Diffs
+```bash
+scion diff
+```
+Shows unified diffs directly in terminal with green additions and red deletions.
+
+### Commit Changes with Agent Provenance
+```bash
+# Standard commit
+scion commit -m "feat: implement token validation"
+
+# Or with AI Agent tracking:
+scion commit -m "fix(auth): fast lease expiry check" --agent claude-code-3.7-sonnet
+```
+Automatically captures agent model name, session context, and Merkle tree root hash.
+
+### View Linear Sequence Graph
+```bash
+scion log
+```
+Prints the commit timeline with linear sequence numbers (`#1`, `#2`, `#3`), short hashes, author, agent tags, and timestamps.
+
+### Line-by-Line Blame
+```bash
+scion blame src/index.ts
+```
+
+### Sub-Second Sparse Clone
+```bash
+# Clone only matching paths into a workspace, virtualizing the rest:
+scion clone ./my-project ./agent-sandbox --sparse "services/auth/**"
+```
+
+### Inspect Commits
+```bash
+scion show [commit-id]
+```
+
+---
+
+## 3. Command Reference
 
 | Command | Description |
 | :--- | :--- |
-| `scn init [repo-name]` | Initializes a new repository on the server and sets up local `.scn/` workspace. |
-| `scn clone <repo> [dir] --sparse <patterns>` | Sub-second clone materializing only files matching sparse patterns (e.g. `services/auth/**`). |
-| `scn status` | Displays rich terminal status card with branch, sequence number, and agent context. |
-| `scn diff` | Shows colorized unified diff against base revision. |
-| `scn commit -m "<msg>" --agent <model>` | Creates local changeset with agent provenance metadata. |
-| `scn submit` | Uploads CAS chunks, executes server-side 3-way rebase, and lands into linear `main` sequence. |
-| `scn log` | Displays graphical commit tree with sequence badges and agent tags. |
-| `scn query file <path> [--rev id]` | Fetches and views file slice directly from server without checking out repo. |
-| `scn query blame <path>` | Streams server-computed line-by-line blame. |
-| `scn query queue` | Inspects live merge queue throughput and latency metrics. |
-| `scn profile [list\|set <patterns>]` | Inspects or updates active sparse checkout profile. |
+| `scion init [name]` | Initialize a standalone OpenScion repository in current directory. |
+| `scion status` | Display working tree status, dirty files, and agent context. |
+| `scion diff` | Inspect colorized unified diffs against HEAD. |
+| `scion commit -m "<msg>"` | Commit changes to local DAG with agent provenance. |
+| `scion log` | View commit timeline with linear sequence numbers. |
+| `scion blame <path>` | Line-by-line blame with sequence numbers and authors. |
+| `scion show [commit-id]` | Display commit details, tree hashes, and file lists. |
+| `scion clone <src> [dir]` | Fast sparse clone from local path or remote repository. |
+| `scion serve [--port 8080]` | Optional: launch central hub server for multi-agent network teams. |
 
 ---
 
-## 4. Web Review Platform ("Antique")
+## 4. Run Automated End-to-End Simulation
 
-A dark-mode, glassmorphic web dashboard built for continuous code review at agent scale.
-
+Test the complete system in action:
 ```bash
-# Start backend control plane
-make server
-
-# In another terminal, start Antique review web app
-make web
-```
-Open **`http://localhost:3000`** to browse:
-* **Timeline & DAG:** Linear sequence numbers, agent models (`Claude 3.7 Sonnet`), prompt trace IDs.
-* **Changeset Inspector & Diffs:** Colorized additions/deletions and chunk hashes.
-* **Live Merge Queue:** Ingest -> Speculation -> Verification -> Land pipeline visualization.
-* **Sparse Merkle Tree Explorer:** Inspect repository hierarchy without cloning.
-
----
-
-## 5. Deployment with Render & Vercel CLIs
-
-### Backend Deployment (Render CLI)
-The backend control plane (`aether-server`) and managed database are defined in [`render.yaml`](render.yaml).
-
-```bash
-# Set your API key
-export RENDER_API_KEY=your_key_here
-
-# Deploy via script or CLI
-./scripts/deploy-render.sh
-# or:
-render blueprints launch --blueprint ./render.yaml
-```
-
-### Frontend Deployment (Vercel CLI)
-The Antique Code Review frontend is preconfigured with [`vercel.json`](vercel.json).
-
-```bash
-# Deploy via script or CLI
-./scripts/deploy-vercel.sh
-# or:
-cd web && vercel deploy --prod
+make demo
 ```

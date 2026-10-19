@@ -33,3 +33,7 @@ Thumbs.db
 # Workspace demo directories
 /tmp/aether-demo/
 mnt/
+
+# Agent customizations & local skills
+.agents/
+

@@ -189,9 +189,9 @@ func MatchesAnyPattern(path string, patterns []string) bool {
 // LoadIgnorePatterns loads ignore rules from .gitignore, .scionignore, and default directories
 func LoadIgnorePatterns(rootPath string) []string {
 	patterns := []string{
-		".scion/**", ".scn/**", ".git/**", "mnt/**", "mnt", "node_modules/**", "web/node_modules/**",
-		"dist/**", "web/dist/**", "bin/**", "data/**", "*.db", "*.db-wal", "*.db-shm",
-		"*.chunk", ".DS_Store", "Thumbs.db", "web/.vercel/**", ".vercel/**",
+		".scion/**", ".scn/**", ".git/**", "mnt/**", "mnt", "node_modules/**",
+		"dist/**", "bin/**", "data/**", "*.db", "*.db-wal", "*.db-shm",
+		"*.chunk", ".DS_Store", "Thumbs.db",
 	}
 
 	for _, name := range []string{".gitignore", ".scionignore"} {

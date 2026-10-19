@@ -1,4 +1,4 @@
-.PHONY: all build install server web demo clean
+.PHONY: all build install server demo clean
 
 all: build install
 

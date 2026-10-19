@@ -77,9 +77,19 @@ scion blame src/index.ts
 scion clone ./my-project ./agent-sandbox --sparse "services/auth/**"
 ```
 
+### Virtual Filesystem Mount (Zero-Byte Ghost Drive)
+```bash
+# Mount current HEAD or any commit as a virtual filesystem:
+scion mount ./mnt
+
+# Or mount specific historical commit:
+scion mount ./mnt --rev #1
+```
+*Instant 0-byte disk footprint. Files stream from CAS chunks on-demand only when opened.*
+
 ### Inspect Commits
 ```bash
-scion show [commit-id]
+scion show #1
 ```
 
 ---
@@ -94,7 +104,8 @@ scion show [commit-id]
 | `scion commit -m "<msg>"` | Commit changes to local DAG with agent provenance. |
 | `scion log` | View commit timeline with linear sequence numbers. |
 | `scion blame <path>` | Line-by-line blame with sequence numbers and authors. |
-| `scion show [commit-id]` | Display commit details, tree hashes, and file lists. |
+| `scion show [commit-id\|#seq]` | Display commit details, tree hashes, and file lists. |
+| `scion mount [dir] [--rev #seq]` | Mount virtual ghost filesystem (zero bytes on disk, lazy-hydrated on read). |
 | `scion clone <src> [dir]` | Fast sparse clone from local path or remote repository. |
 | `scion serve [--port 8080]` | Optional: launch central hub server for multi-agent network teams. |
 

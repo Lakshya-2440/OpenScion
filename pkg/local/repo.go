@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/aether/scn/pkg/cas"
@@ -169,6 +170,35 @@ func (r *LocalRepo) GetHeadChangeset() (*graph.Changeset, error) {
 	}
 	return r.DB.GetChangeset(branch.HeadID)
 }
+
+// ResolveChangeset resolves a reference (HEAD, sequence #3 or 3, or commit ID) to a Changeset
+func (r *LocalRepo) ResolveChangeset(ref string) (*graph.Changeset, error) {
+	if ref == "" || ref == "HEAD" {
+		return r.GetHeadChangeset()
+	}
+
+	clean := strings.TrimPrefix(ref, "#")
+	if seq, err := strconv.ParseInt(clean, 10, 64); err == nil {
+		return r.DB.GetChangesetBySequence(r.Config.RepoID, seq)
+	}
+
+	// Try direct ID lookup
+	cs, err := r.DB.GetChangeset(ref)
+	if err == nil {
+		return cs, nil
+	}
+
+	// Prefix search in recent changesets
+	changesets, _ := r.DB.GetChangesetsByRepo(r.Config.RepoID, 200)
+	for _, c := range changesets {
+		if strings.HasPrefix(c.ID, ref) {
+			return &c, nil
+		}
+	}
+
+	return nil, fmt.Errorf("changeset %q not found", ref)
+}
+
 
 // Status inspects the working copy against HEAD
 func (r *LocalRepo) Status() ([]tree.DiffEntry, *tree.Tree, *graph.Changeset, error) {

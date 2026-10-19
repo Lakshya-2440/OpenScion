@@ -17,6 +17,7 @@ import (
 	"github.com/aether/scn/pkg/local"
 	"github.com/aether/scn/pkg/tree"
 	"github.com/aether/scn/pkg/ui"
+	"github.com/aether/scn/pkg/vfs"
 )
 
 func main() {
@@ -45,6 +46,8 @@ func main() {
 		cmdShow(args)
 	case "clone":
 		cmdClone(args)
+	case "mount":
+		cmdMount(args)
 	case "serve":
 		cmdServe(args)
 	case "help", "--help", "-h":
@@ -66,8 +69,9 @@ func printUsage() {
 	fmt.Println("  commit -m <msg>               Commit changes to local DAG with agent provenance")
 	fmt.Println("  log                           View clean commit timeline with linear sequence numbers")
 	fmt.Println("  blame <path>                  Show line-by-line blame with sequence numbers and authors")
-	fmt.Println("  show [commit-id]              Display commit details and tree structure")
+	fmt.Println("  show [commit-id|#seq]         Display commit details and tree structure")
 	fmt.Println("  clone <source> [dir]          Fast sparse clone from local path or remote repository")
+	fmt.Println("  mount [dir] [--rev #seq]      Mount virtual filesystem (instant 0-byte ghost tree, lazy fetch)")
 	fmt.Println()
 	fmt.Println("Server & Collaboration:")
 	fmt.Println("  serve [--port 8080]           Start an OpenScion central hub server for multi-agent teams")
@@ -476,7 +480,7 @@ func cmdShow(args []string) {
 
 	var cs *graph.Changeset
 	if len(args) > 0 {
-		cs, err = repo.DB.GetChangeset(args[0])
+		cs, err = repo.ResolveChangeset(args[0])
 	} else {
 		cs, err = repo.GetHeadChangeset()
 	}
@@ -625,3 +629,52 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+func cmdMount(args []string) {
+	fs := flag.NewFlagSet("mount", flag.ExitOnError)
+	revFlag := fs.String("rev", "", "Commit sequence number (#1) or ID to mount (default: HEAD)")
+	fs.Parse(args)
+
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	var cs *graph.Changeset
+	if *revFlag != "" {
+		cs, err = repo.ResolveChangeset(*revFlag)
+	} else {
+		cs, err = repo.GetHeadChangeset()
+	}
+
+	if err != nil {
+		ui.PrintError(fmt.Sprintf("Failed to resolve commit: %v", err))
+		os.Exit(1)
+	}
+
+	t, err := repo.DB.GetTree(cs.RootTreeHash)
+	if err != nil {
+		ui.PrintError(fmt.Sprintf("Failed to load Merkle tree for commit #%d: %v", cs.SequenceNumber, err))
+		os.Exit(1)
+	}
+
+	mountPoint := "./mnt"
+	if len(fs.Args()) > 0 {
+		mountPoint = fs.Args()[0]
+	}
+
+	opts := vfs.MountOptions{
+		MountPoint: mountPoint,
+		CommitSeq:  cs.SequenceNumber,
+		ReadOnly:   true,
+	}
+
+	commitTime := time.Unix(cs.CreatedAt, 0)
+	if err := vfs.Mount(t, repo.Store, commitTime, opts); err != nil {
+		ui.PrintError(fmt.Sprintf("VFS mount error: %v", err))
+		os.Exit(1)
+	}
+}
+

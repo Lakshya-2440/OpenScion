@@ -305,6 +305,41 @@ func (d *DB) GetChangeset(id string) (*graph.Changeset, error) {
 	return &cs, nil
 }
 
+func (d *DB) GetChangesetBySequence(repoID string, seq int64) (*graph.Changeset, error) {
+	row := d.sqlDB.QueryRow(`SELECT id, repo_id, sequence_number, root_tree_hash, parent_ids,
+		author, message, agent_model, session_id, task_trace_id, created_at
+		FROM changesets WHERE repo_id = ? AND sequence_number = ? LIMIT 1`, repoID, seq)
+
+	var cs graph.Changeset
+	var parentIDsStr string
+	var agentModel, sessionID, taskTraceID sql.NullString
+
+	if err := row.Scan(
+		&cs.ID, &cs.RepoID, &cs.SequenceNumber, &cs.RootTreeHash, &parentIDsStr,
+		&cs.Author, &cs.Message, &agentModel, &sessionID, &taskTraceID, &cs.CreatedAt,
+	); err != nil {
+		return nil, fmt.Errorf("changeset with sequence #%d not found: %w", seq, err)
+	}
+
+	if parentIDsStr != "" {
+		cs.ParentIDs = strings.Split(parentIDsStr, ",")
+	} else {
+		cs.ParentIDs = []string{}
+	}
+	if agentModel.Valid {
+		cs.AgentModel = agentModel.String
+	}
+	if sessionID.Valid {
+		cs.SessionID = sessionID.String
+	}
+	if taskTraceID.Valid {
+		cs.TaskTraceID = taskTraceID.String
+	}
+
+	return &cs, nil
+}
+
+
 func (d *DB) GetChangesetsByRepo(repoID string, limit int) ([]graph.Changeset, error) {
 	if limit <= 0 {
 		limit = 50

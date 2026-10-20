@@ -121,7 +121,8 @@ func cmdInit(args []string) {
 	fmt.Printf("  • Repository:  %s%s%s\n", ui.Bold, repo.Config.RepoName, ui.Reset)
 	fmt.Printf("  • Branch:      %smain%s (Sequence #1)\n", ui.BrightCyan, ui.Reset)
 	fmt.Printf("  • Engine:      Embedded Merkle CAS + ACID SQLite\n")
-	fmt.Printf("  • Tracking:    %s%s %s%s\n\n", ui.BrightPurple, ui.SymAgent, repo.Config.AgentModel, ui.Reset)
+	fmt.Printf("  • Tracking:    %s%s %s%s\n", ui.BrightPurple, ui.SymAgent, repo.Config.AgentModel, ui.Reset)
+	fmt.Printf("  • Agent Rules: %sAuto-generated AGENTS.md & CLAUDE.md%s\n\n", ui.BrightGreen, ui.Reset)
 	fmt.Printf("Run %s'scion status'%s or %s'scion commit -m <msg>'%s to begin.\n\n", ui.BrightCyan, ui.Reset, ui.BrightCyan, ui.Reset)
 }
 

@@ -419,12 +419,23 @@ func Mount(t *tree.Tree, store *cas.Store, commitTime time.Time, opts MountOptio
 			mounted = true
 			fmt.Printf("\033[32m✓ Mounted natively to %s\033[0m\n", absMountPoint)
 		}
+	} else if runtime.GOOS == "windows" {
+		// Windows native WebDAV drive mapping
+		cmd := exec.Command("net", "use", "*", webdavURL)
+		if out, err := cmd.Output(); err == nil {
+			mounted = true
+			fmt.Printf("\033[32m✓ Mounted natively via Windows WebDAV network drive: %s\033[0m\n", strings.TrimSpace(string(out)))
+		}
 	}
 
 	if !mounted {
 		fmt.Printf("\033[33mDirect OS kernel mount skipped or requires permissions.\033[0m\n")
 		fmt.Printf("Access directly via WebDAV URL: \033[36m%s\033[0m\n", webdavURL)
-		fmt.Printf("Or connect in Finder: Go -> Connect to Server -> %s\n", webdavURL)
+		if runtime.GOOS == "windows" {
+			fmt.Printf("Or in File Explorer: Map Network Drive -> %s\n", webdavURL)
+		} else {
+			fmt.Printf("Or connect in Finder: Go -> Connect to Server -> %s\n", webdavURL)
+		}
 	}
 
 	fmt.Println("\n\033[2mStreaming filesystem active. Press Ctrl+C to unmount...\033[0m\n")
@@ -445,8 +456,10 @@ func Mount(t *tree.Tree, store *cas.Store, commitTime time.Time, opts MountOptio
 		if runtime.GOOS == "darwin" {
 			_ = exec.Command("diskutil", "unmount", "force", absMountPoint).Run()
 			_ = exec.Command("umount", absMountPoint).Run()
-		} else {
+		} else if runtime.GOOS == "linux" {
 			_ = exec.Command("umount", absMountPoint).Run()
+		} else if runtime.GOOS == "windows" {
+			_ = exec.Command("net", "use", "*", "/delete", "/y").Run()
 		}
 	}
 

@@ -99,6 +99,9 @@ func InitLocalRepo(workDir, repoName string) (*LocalRepo, error) {
 		return nil, err
 	}
 
+	// Auto-generate agent instructions so AI coding agents use OpenScion automatically
+	createAgentInstructions(workDir, repoName)
+
 	return &LocalRepo{
 		WorkDir:  workDir,
 		ScionDir: scionDir,
@@ -331,3 +334,37 @@ func getGitAuthor() string {
 	}
 	return fmt.Sprintf("%s <%s@local>", user, user)
 }
+
+func createAgentInstructions(workDir, repoName string) {
+	agentsPath := filepath.Join(workDir, "AGENTS.md")
+	if _, err := os.Stat(agentsPath); os.IsNotExist(err) {
+		content := `# Agent Instruction Protocol — OpenScion VCS
+
+This repository uses **OpenScion** (` + "`scn`" + ` / ` + "`scion`" + `) for version control, **NOT Git**.
+Do NOT run ` + "`git add`" + ` or ` + "`git commit`" + `.
+
+## Required Agent Commands
+- Check working tree: ` + "`scn status`" + `
+- Inspect diffs: ` + "`scn diff`" + `
+- Record changesets: ` + "`scn commit -m \"<message>\" --agent <your-model-name>`" + `
+- View history: ` + "`scn log`" + `
+- Inspect commits: ` + "`scn show <#seq|hash>`" + `
+- Sync with remote: ` + "`scn pull`" + ` / ` + "`scn push`" + `
+
+Every commit must include ` + "`--agent <model>`" + ` for provenance tracking.
+`
+		_ = os.WriteFile(agentsPath, []byte(content), 0644)
+	}
+
+	claudePath := filepath.Join(workDir, "CLAUDE.md")
+	if _, err := os.Stat(claudePath); os.IsNotExist(err) {
+		content := `# Claude Code Instructions — OpenScion VCS
+
+This repository uses **OpenScion** (` + "`scn`" + `) instead of Git.
+- Always use ` + "`scn status`" + `, ` + "`scn diff`" + `, and ` + "`scn commit -m \"...\" --agent claude-code`" + `.
+- Never use Git commands in this workspace.
+`
+		_ = os.WriteFile(claudePath, []byte(content), 0644)
+	}
+}
+

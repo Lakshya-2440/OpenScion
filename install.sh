@@ -169,7 +169,7 @@ EOF
 fi
 
 if [ "$AGENT_CONFIGURED" -eq 1 ]; then
-  echo -e "${GREEN}${BOLD}✓ Auto-configured AI coding agents (Claude Code) to use OpenScion (scn).${RESET}"
+  echo -e "${GREEN}${BOLD}✓ Auto-configured AI coding agents to use OpenScion (scn).${RESET}"
 fi
 
 echo ""

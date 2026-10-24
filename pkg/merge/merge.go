@@ -144,6 +144,19 @@ func ThreeWayMerge(base, ours, theirs *tree.Tree, store *cas.Store) (*Result, er
 		}
 	}
 
+	// Detect structural file vs directory collisions
+	for p := range merged.Entries {
+		prefix := p + "/"
+		for other := range merged.Entries {
+			if strings.HasPrefix(other, prefix) {
+				conflicts = append(conflicts, Conflict{
+					Path:   p,
+					Reason: fmt.Sprintf("Structural conflict: %q exists as both a file and directory (%s)", p, other),
+				})
+			}
+		}
+	}
+
 	merged.ComputeHash()
 
 	return &Result{
@@ -171,6 +184,18 @@ func mergeFileBlobs(
 
 	mergedContent, clean := mergeLines(baseData, oursData, theirsData)
 	if !clean {
+		if len(mergedContent) > 0 {
+			manifest, err := store.PutBlob(mergedContent)
+			if err == nil {
+				return &tree.Entry{
+					Path: path,
+					Type: tree.TypeBlob,
+					Hash: manifest.BlobHash,
+					Size: manifest.TotalSize,
+					Mode: oursEntry.Mode,
+				}, false, nil
+			}
+		}
 		return nil, false, nil
 	}
 
@@ -189,7 +214,7 @@ func mergeFileBlobs(
 	return entry, true, nil
 }
 
-// mergeLines performs a simple, effective 3-way line merge
+// mergeLines performs a comprehensive diff-based 3-way line merge
 func mergeLines(base, ours, theirs []byte) ([]byte, bool) {
 	// If ours or theirs is identical to base
 	if bytes.Equal(ours, base) {
@@ -202,90 +227,30 @@ func mergeLines(base, ours, theirs []byte) ([]byte, bool) {
 		return ours, true
 	}
 
+	// Check if any file is binary
+	if isBinary(base) || isBinary(ours) || isBinary(theirs) {
+		return nil, false
+	}
+
 	baseLines := splitLines(string(base))
 	oursLines := splitLines(string(ours))
 	theirsLines := splitLines(string(theirs))
 
-	// Simple fast path: Append-only checks or prefix/suffix checks
-	// If base was empty (new file on both sides)
-	if len(baseLines) == 0 {
-		return nil, false
+	mergedLines, clean := Diff3Merge(baseLines, oursLines, theirsLines)
+
+	eol := "\n"
+	if bytes.Contains(ours, []byte("\r\n")) || bytes.Contains(theirs, []byte("\r\n")) {
+		eol = "\r\n"
 	}
 
-	// Line-by-line reconciliation
-	var out []string
-	clean := true
-
-	maxLen := len(baseLines)
-	if len(oursLines) > maxLen {
-		maxLen = len(oursLines)
-	}
-	if len(theirsLines) > maxLen {
-		maxLen = len(theirsLines)
-	}
-
-	// Check if changes are non-overlapping chunks
-	// If line counts match exactly:
-	if len(baseLines) == len(oursLines) && len(baseLines) == len(theirsLines) {
-		for i := 0; i < len(baseLines); i++ {
-			b := baseLines[i]
-			o := oursLines[i]
-			t := theirsLines[i]
-
-			if o == b && t == b {
-				out = append(out, b)
-			} else if o != b && t == b {
-				out = append(out, o)
-			} else if t != b && o == b {
-				out = append(out, t)
-			} else if o == t {
-				out = append(out, o)
-			} else {
-				// Overlap conflict
-				clean = false
-				out = append(out, "<<<<<<< OURS (MAIN)")
-				out = append(out, o)
-				out = append(out, "=======")
-				out = append(out, t)
-				out = append(out, ">>>>>>> THEIRS (SUBMITTED)")
-			}
+	var buf bytes.Buffer
+	for i, l := range mergedLines {
+		buf.WriteString(l)
+		if i < len(mergedLines)-1 || strings.HasSuffix(string(ours), "\n") || strings.HasSuffix(string(theirs), "\n") {
+			buf.WriteString(eol)
 		}
-		var buf bytes.Buffer
-		for i, l := range out {
-			buf.WriteString(l)
-			if i < len(out)-1 || strings.HasSuffix(string(ours), "\n") {
-				buf.WriteString("\n")
-			}
-		}
-		return buf.Bytes(), clean
 	}
-
-	// For general case with different line lengths:
-	// If one modified the header and the other modified the footer:
-	// Find common prefix and common suffix with base
-	prefixOurs := commonPrefix(baseLines, oursLines)
-	prefixTheirs := commonPrefix(baseLines, theirsLines)
-	suffixOurs := commonSuffix(baseLines, oursLines)
-	suffixTheirs := commonSuffix(baseLines, theirsLines)
-
-	// If ours modified tail and theirs modified head:
-	if prefixOurs == len(baseLines) && suffixTheirs == len(baseLines) {
-		res := append([]string{}, theirsLines[:len(theirsLines)-suffixTheirs]...)
-		res = append(res, baseLines...)
-		res = append(res, oursLines[prefixOurs:]...)
-		return []byte(strings.Join(res, "\n") + "\n"), true
-	}
-
-	// If theirs modified tail and ours modified head:
-	if prefixTheirs == len(baseLines) && suffixOurs == len(baseLines) {
-		res := append([]string{}, oursLines[:len(oursLines)-suffixOurs]...)
-		res = append(res, baseLines...)
-		res = append(res, theirsLines[prefixTheirs:]...)
-		return []byte(strings.Join(res, "\n") + "\n"), true
-	}
-
-	// Conflict fallback
-	return nil, false
+	return buf.Bytes(), clean
 }
 
 func splitLines(s string) []string {

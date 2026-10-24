@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -25,10 +26,39 @@ type BlobChunk struct {
 
 // BlobManifest maps a logical file blob to its constituent chunks
 type BlobManifest struct {
-	BlobHash       string   `json:"blob_hash"`
-	TotalSize      int64    `json:"total_size"`
-	ChunkHashes    []string `json:"chunk_hashes"`
-	IsSingleChunk  bool     `json:"is_single_chunk"`
+	BlobHash      string   `json:"blob_hash"`
+	TotalSize     int64    `json:"total_size"`
+	ChunkHashes   []string `json:"chunk_hashes"`
+	IsSingleChunk bool     `json:"is_single_chunk"`
+}
+
+func ValidateChunk(chunk *BlobChunk) error {
+	if chunk == nil || chunk.Hash == "" {
+		return fmt.Errorf("chunk hash is required")
+	}
+	raw, err := decompressChunk(chunk.Data)
+	if err != nil {
+		return fmt.Errorf("invalid compressed chunk %s: %w", chunk.Hash, err)
+	}
+	if chunk.UncompressedSz != len(raw) {
+		return fmt.Errorf("chunk %s size mismatch: declared %d, got %d", chunk.Hash, chunk.UncompressedSz, len(raw))
+	}
+	if HashBytes(raw) != chunk.Hash {
+		return fmt.Errorf("chunk %s hash mismatch", chunk.Hash)
+	}
+	return nil
+}
+
+func ValidateManifest(m *BlobManifest) error {
+	if m == nil || m.BlobHash == "" {
+		return fmt.Errorf("blob hash is required")
+	}
+	for _, hash := range m.ChunkHashes {
+		if hash == "" {
+			return fmt.Errorf("manifest %s contains an empty chunk hash", m.BlobHash)
+		}
+	}
+	return nil
 }
 
 // Store provides content-addressable storage on local disk
@@ -76,6 +106,9 @@ func (s *Store) chunkPath(hash string) string {
 
 // PutChunk stores a compressed chunk locally and uploads to S3 if configured
 func (s *Store) PutChunk(chunk *BlobChunk) error {
+	if err := ValidateChunk(chunk); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -93,7 +126,9 @@ func (s *Store) PutChunk(chunk *BlobChunk) error {
 
 	// Upload to S3 / MinIO backend if attached
 	if s.remote != nil {
-		_ = s.remote.PutChunk(chunk.Hash, chunk.Data)
+		if err := s.remote.PutChunk(chunk.Hash, chunk.Data); err != nil {
+			return fmt.Errorf("failed to replicate chunk %s: %w", chunk.Hash, err)
+		}
 	}
 	return nil
 }
@@ -107,9 +142,14 @@ func (s *Store) GetChunk(hash string) (*BlobChunk, error) {
 	s.mu.RUnlock()
 
 	if err == nil {
+		raw, decodeErr := decompressChunk(compressedData)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
 		return &BlobChunk{
-			Hash: hash,
-			Data: compressedData,
+			Hash:           hash,
+			UncompressedSz: len(raw),
+			Data:           compressedData,
 		}, nil
 	}
 
@@ -123,16 +163,20 @@ func (s *Store) GetChunk(hash string) (*BlobChunk, error) {
 			_ = os.WriteFile(targetPath, data, 0644)
 			s.mu.Unlock()
 
+			raw, decodeErr := decompressChunk(data)
+			if decodeErr != nil {
+				return nil, decodeErr
+			}
 			return &BlobChunk{
-				Hash: hash,
-				Data: data,
+				Hash:           hash,
+				UncompressedSz: len(raw),
+				Data:           data,
 			}, nil
 		}
 	}
 
 	return nil, fmt.Errorf("chunk not found: %s: %w", hash, err)
 }
-
 
 // PutBlob processes raw content: chunks it, compresses each chunk, stores chunks, and returns manifest
 func (s *Store) PutBlob(content []byte) (*BlobManifest, error) {
@@ -194,7 +238,63 @@ func (s *Store) PutBlob(content []byte) (*BlobManifest, error) {
 	return manifest, nil
 }
 
-// GetBlob reconstructs full raw content from its manifest
+// PutBlobFromFile streams content from disk in 32KB chunks, avoiding multi-GB RAM spikes
+func (s *Store) PutBlobFromFile(filePath string) (*BlobManifest, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	totalLen := stat.Size()
+	hasher := sha256.New()
+	var chunkHashes []string
+
+	buf := make([]byte, ChunkSize)
+	for {
+		n, readErr := io.ReadFull(file, buf)
+		if n > 0 {
+			slice := buf[:n]
+			hasher.Write(slice)
+			cHash := HashBytes(slice)
+			chunk, err := compressChunk(cHash, slice)
+			if err != nil {
+				return nil, err
+			}
+			if err := s.PutChunk(chunk); err != nil {
+				return nil, err
+			}
+			chunkHashes = append(chunkHashes, cHash)
+		}
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+
+	fullHash := hex.EncodeToString(hasher.Sum(nil))
+	manifest := &BlobManifest{
+		BlobHash:      fullHash,
+		TotalSize:     totalLen,
+		ChunkHashes:   chunkHashes,
+		IsSingleChunk: len(chunkHashes) <= 1,
+	}
+
+	if err := s.SaveManifest(manifest); err != nil {
+		return nil, err
+	}
+
+	return manifest, nil
+}
+
+// GetBlob reconstructs full raw content from its manifest with bit-rot integrity checking
 func (s *Store) GetBlob(manifest *BlobManifest) ([]byte, error) {
 	var buf bytes.Buffer
 	for _, cHash := range manifest.ChunkHashes {
@@ -203,12 +303,77 @@ func (s *Store) GetBlob(manifest *BlobManifest) ([]byte, error) {
 			return nil, err
 		}
 		raw, err := decompressChunk(chunk.Data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decompress chunk %s: %w", cHash, err)
+		if err != nil || HashBytes(raw) != cHash {
+			// Corrupted chunk detected on disk: remove corrupt chunk and attempt recovery from remote
+			_ = os.Remove(s.chunkPath(cHash))
+			if s.remote != nil {
+				if remoteData, s3Err := s.remote.GetChunk(cHash); s3Err == nil {
+					if rawRemote, decErr := decompressChunk(remoteData); decErr == nil && HashBytes(rawRemote) == cHash {
+						_ = s.PutChunk(&BlobChunk{Hash: cHash, Data: remoteData})
+						buf.Write(rawRemote)
+						continue
+					}
+				}
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to decompress chunk %s: %w", cHash, err)
+			}
+			return nil, fmt.Errorf("corrupted chunk %s: hash mismatch", cHash)
 		}
 		buf.Write(raw)
 	}
-	return buf.Bytes(), nil
+	content := buf.Bytes()
+	if int64(len(content)) != manifest.TotalSize || HashBytes(content) != manifest.BlobHash {
+		return nil, fmt.Errorf("blob %s integrity check failed", manifest.BlobHash)
+	}
+	return content, nil
+}
+
+// GC removes unreferenced chunks and manifests from local CAS storage
+func (s *Store) GC(referencedHashes map[string]bool) (int, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	deletedCount := 0
+	var freedBytes int64
+
+	// Clean objects/
+	objDir := filepath.Join(s.baseDir, "objects")
+	_ = filepath.Walk(objDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".chunk") {
+			return nil
+		}
+		hash := strings.TrimSuffix(info.Name(), ".chunk")
+		if !referencedHashes[hash] {
+			freedBytes += info.Size()
+			deletedCount++
+			_ = os.Remove(p)
+		}
+		return nil
+	})
+
+	// Clean manifests/
+	manDir := filepath.Join(s.baseDir, "manifests")
+	_ = filepath.Walk(manDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".json") {
+			return nil
+		}
+		hash := strings.TrimSuffix(info.Name(), ".json")
+		if !referencedHashes[hash] {
+			freedBytes += info.Size()
+			deletedCount++
+			_ = os.Remove(p)
+		}
+		return nil
+	})
+
+	return deletedCount, freedBytes, nil
 }
 
 // GetBlobByHash reads manifest by blob hash and returns reconstructed bytes
@@ -227,7 +392,11 @@ func (s *Store) manifestPath(blobHash string) string {
 	return filepath.Join(s.baseDir, "manifests", blobHash[0:2], blobHash[2:4], blobHash+".json")
 }
 
-func (s *Store) saveManifest(m *BlobManifest) error {
+// SaveManifest writes a BlobManifest into local CAS and syncs to remote if configured
+func (s *Store) SaveManifest(m *BlobManifest) error {
+	if err := ValidateManifest(m); err != nil {
+		return err
+	}
 	mPath := s.manifestPath(m.BlobHash)
 	if err := os.MkdirAll(filepath.Dir(mPath), 0755); err != nil {
 		return err
@@ -241,9 +410,15 @@ func (s *Store) saveManifest(m *BlobManifest) error {
 	}
 
 	if s.remote != nil {
-		_ = s.remote.PutManifest(m.BlobHash, data)
+		if err := s.remote.PutManifest(m.BlobHash, data); err != nil {
+			return fmt.Errorf("failed to replicate manifest %s: %w", m.BlobHash, err)
+		}
 	}
 	return nil
+}
+
+func (s *Store) saveManifest(m *BlobManifest) error {
+	return s.SaveManifest(m)
 }
 
 func (s *Store) GetManifest(blobHash string) (*BlobManifest, error) {

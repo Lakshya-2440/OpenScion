@@ -37,3 +37,16 @@ mnt/
 # Agent customizations & local skills
 .agents/
 
+# Video, audio & media files
+*.mp4
+*.webm
+*.mov
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.aac
+video/
+renders/
+
+

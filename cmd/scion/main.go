@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/aether/scn/pkg/db"
 	"github.com/aether/scn/pkg/graph"
 	"github.com/aether/scn/pkg/local"
+	"github.com/aether/scn/pkg/merge"
 	"github.com/aether/scn/pkg/tree"
 	"github.com/aether/scn/pkg/ui"
 	"github.com/aether/scn/pkg/vfs"
@@ -38,6 +41,10 @@ func main() {
 		cmdDiff(args)
 	case "commit":
 		cmdCommit(args)
+	case "checkout":
+		cmdCheckout(args)
+	case "branch":
+		cmdBranch(args)
 	case "log":
 		cmdLog(args)
 	case "blame":
@@ -50,7 +57,7 @@ func main() {
 		cmdMount(args)
 	case "remote":
 		cmdRemote(args)
-	case "push":
+	case "push", "submit":
 		cmdPush(args)
 	case "pull":
 		cmdPull(args)
@@ -58,6 +65,10 @@ func main() {
 		cmdSync(args)
 	case "serve":
 		cmdServe(args)
+	case "gc":
+		cmdGC(args)
+	case "bench":
+		cmdBench(args)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -75,11 +86,14 @@ func printUsage() {
 	fmt.Println("  status [-v]                   Show working tree status and categorized changes")
 	fmt.Println("  diff [-s|-a] [file]           Inspect colorized diffs (summary, hunk view, or stat)")
 	fmt.Println("  commit -m <msg>               Commit changes to local DAG with agent provenance")
+	fmt.Println("  branch [name]                 List or create branches")
+	fmt.Println("  checkout <path|branch> [--rev #seq] Restore file, switch branch, or restore revision")
 	fmt.Println("  log                           View clean commit timeline with linear sequence numbers")
 	fmt.Println("  blame <path>                  Show line-by-line blame with sequence numbers and authors")
 	fmt.Println("  show [commit-id|#seq]         Display commit details and tree structure")
 	fmt.Println("  clone <source> [dir]          Fast sparse clone from local path or remote repository")
 	fmt.Println("  mount [dir] [--rev #seq]      Mount virtual filesystem (instant 0-byte ghost tree, lazy fetch)")
+	fmt.Println("  bench                         Run reproducible performance benchmarks")
 	fmt.Println()
 	fmt.Println("Remote & Team Collaboration:")
 	fmt.Println("  remote [add|set-url|rm] <url> Configure remote team server (origin)")
@@ -347,21 +361,25 @@ func cmdDiff(args []string) {
 			continue
 		}
 
-		// Modified file: simple hunk view
-		fmt.Printf("  %s@@ -1,%d +1,%d @@%s\n", ui.Cyan, len(st.oldLines), len(st.newLines), ui.Reset)
-		for i := 0; i < len(st.newLines); i++ {
-			if i < len(st.oldLines) && st.oldLines[i] == st.newLines[i] {
-				// Context line (only show around changes)
-				if i < 3 || i >= len(st.newLines)-2 {
-					fmt.Printf("  %s%4d%s │   %s\n", ui.DarkGray, i+1, ui.Reset, st.newLines[i])
-				} else if i == 3 {
-					fmt.Printf("  %s ... │%s\n", ui.DarkGray, ui.Reset)
+		// Modified file: unified hunk view using Myers diff
+		edits := merge.MyersDiff(st.oldLines, st.newLines)
+		hunks := merge.GenerateUnifiedHunks(edits, 3)
+		for _, h := range hunks {
+			fmt.Printf("  %s@@ -%d,%d +%d,%d @@%s\n", ui.Cyan, h.OldStart, h.OldCount, h.NewStart, h.NewCount, ui.Reset)
+			for _, l := range h.Lines {
+				if len(l) == 0 {
+					continue
 				}
-			} else {
-				if i < len(st.oldLines) {
-					fmt.Printf("  %s%4d%s │ %s-%s %s\n", ui.DarkGray, i+1, ui.Reset, ui.Red, ui.Reset, st.oldLines[i])
+				prefix := l[0]
+				content := l[1:]
+				switch prefix {
+				case '-':
+					fmt.Printf("  %s-%s %s\n", ui.Red, ui.Reset, content)
+				case '+':
+					fmt.Printf("  %s+%s %s\n", ui.BrightGreen, ui.Reset, content)
+				default:
+					fmt.Printf("  %s  %s%s\n", ui.DarkGray, ui.Reset, content)
 				}
-				fmt.Printf("  %s%4d%s │ %s+%s %s\n", ui.DarkGray, i+1, ui.Reset, ui.BrightGreen, ui.Reset, st.newLines[i])
 			}
 		}
 		fmt.Println()
@@ -405,6 +423,134 @@ func cmdCommit(args []string) {
 		ui.BrightGreen+ui.Bold, repo.Config.Branch, cs.SequenceNumber, cs.ShortID(), ui.Reset+ui.Bold, cs.Message)
 	fmt.Printf("   %s%d file(s) changed%s%s\n", ui.Dim, fileCount, ui.Reset, agentTag)
 	fmt.Printf("   %sTree root: %s%s\n\n", ui.Dim, cs.RootTreeHash[:min(12, len(cs.RootTreeHash))], ui.Reset)
+}
+
+func cmdBranch(args []string) {
+	fs := flag.NewFlagSet("branch", flag.ExitOnError)
+	deleteFlag := fs.String("d", "", "Delete branch")
+	fs.StringVar(deleteFlag, "delete", "", "Delete branch")
+	fs.Parse(args)
+
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	if *deleteFlag != "" {
+		if err := repo.DeleteBranch(*deleteFlag); err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to delete branch %q: %v", *deleteFlag, err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Deleted branch %q", *deleteFlag))
+		return
+	}
+
+	if len(fs.Args()) == 0 {
+		branches, err := repo.ListBranches()
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to list branches: %v", err))
+			os.Exit(1)
+		}
+		for _, b := range branches {
+			prefix := "  "
+			color := ui.Reset
+			if b.Name == repo.Config.Branch {
+				prefix = "* "
+				color = ui.BrightGreen + ui.Bold
+			}
+			fmt.Printf("%s%s%s%s (seq #%d)\n", color, prefix, b.Name, ui.Reset, b.SequenceNumber)
+		}
+		return
+	}
+
+	newBranch := fs.Args()[0]
+	if err := repo.CreateBranch(newBranch); err != nil {
+		ui.PrintError(fmt.Sprintf("Failed to create branch: %v", err))
+		os.Exit(1)
+	}
+	ui.PrintSuccess(fmt.Sprintf("Created branch %q", newBranch))
+}
+
+func cmdCheckout(args []string) {
+	fs := flag.NewFlagSet("checkout", flag.ExitOnError)
+	revFlag := fs.String("rev", "", "Commit sequence number (#seq) or ID to restore from")
+	branchFlag := fs.Bool("b", false, "Create and switch to a new branch")
+	fs.Parse(args)
+
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	if len(fs.Args()) == 0 {
+		if *revFlag != "" {
+			count, err := repo.RestoreAll(*revFlag)
+			if err != nil {
+				ui.PrintError(fmt.Sprintf("Failed to checkout revision %s: %v", *revFlag, err))
+				os.Exit(1)
+			}
+			ui.PrintSuccess(fmt.Sprintf("Checked out revision %s (%d files materialized)", *revFlag, count))
+			return
+		}
+		ui.PrintError("Usage: scion checkout [-b] <branch> OR scion checkout [--rev #seq] <path>")
+		os.Exit(1)
+	}
+
+	target := fs.Args()[0]
+
+	// 1. If -b flag is set, create and switch
+	if *branchFlag {
+		if err := repo.CreateBranch(target); err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to create branch: %v", err))
+			os.Exit(1)
+		}
+		if err := repo.SwitchBranch(target); err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to switch to branch: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Switched to new branch %q", target))
+		return
+	}
+
+	// 2. Check if target is a branch name
+	branches, err := repo.ListBranches()
+	if err == nil {
+		for _, b := range branches {
+			if b.Name == target {
+				if err := repo.SwitchBranch(target); err != nil {
+					ui.PrintError(fmt.Sprintf("Failed to switch branch: %v", err))
+					os.Exit(1)
+				}
+				ui.PrintSuccess(fmt.Sprintf("Switched to branch %q", target))
+				return
+			}
+		}
+	}
+
+	// 3. Otherwise treat target as a file path to restore
+	if target == "." {
+		count, err := repo.RestoreAll(*revFlag)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to restore workspace: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Restored working directory (%d files)", count))
+		return
+	}
+
+	if err := repo.RestoreFile(target, *revFlag); err != nil {
+		ui.PrintError(fmt.Sprintf("Checkout failed: %v", err))
+		os.Exit(1)
+	}
+	revName := "HEAD"
+	if *revFlag != "" {
+		revName = *revFlag
+	}
+	ui.PrintSuccess(fmt.Sprintf("Restored %q from %s", target, revName))
 }
 
 func cmdLog(args []string) {
@@ -541,6 +687,50 @@ func cmdClone(args []string) {
 	}
 
 	start := time.Now()
+
+	// Remote clone via HTTP/HTTPS
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		u, err := url.Parse(source)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Invalid remote URL %s: %v", source, err))
+			os.Exit(1)
+		}
+		repoName := filepath.Base(strings.TrimSuffix(u.Path, "/"))
+		if repoName == "" || repoName == "." || repoName == "/" {
+			repoName = "repo"
+		}
+		if len(fs.Args()) < 2 {
+			target = repoName
+		}
+		serverURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+
+		targetRepo, err := local.InitLocalRepo(target, repoName)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to initialize target workspace: %v", err))
+			os.Exit(1)
+		}
+		defer targetRepo.Close()
+
+		targetRepo.Config.RemoteURL = serverURL
+		targetRepo.Config.RepoName = repoName
+		if err := targetRepo.SaveConfig(); err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to save remote config: %v", err))
+			os.Exit(1)
+		}
+
+		ui.PrintInfo(fmt.Sprintf("Cloning remote repository %q from %s...", repoName, serverURL))
+		pullRes, err := targetRepo.Pull()
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to pull from remote: %v", err))
+			os.Exit(1)
+		}
+
+		elapsed := time.Since(start).Milliseconds()
+		ui.PrintSuccess(fmt.Sprintf("Cloned into %q (%d files materialized, %d changesets) in %dms!",
+			target, pullRes.UpdatedFiles, pullRes.PulledChangesets, elapsed))
+		return
+	}
+
 	sourceRepo, err := local.OpenLocalRepo(source)
 	if err != nil {
 		ui.PrintError(fmt.Sprintf("Failed to open source repo %s: %v", source, err))
@@ -561,9 +751,10 @@ func cmdClone(args []string) {
 	}
 
 	var patterns []string
+	sparseTree := headTree
 	if *sparseFlag != "" {
 		patterns = strings.Split(*sparseFlag, ",")
-		headTree = headTree.FilterSparse(patterns)
+		sparseTree = headTree.FilterSparse(patterns)
 	}
 
 	targetRepo, err := local.InitLocalRepo(target, sourceRepo.Config.RepoName)
@@ -573,8 +764,13 @@ func cmdClone(args []string) {
 	}
 	defer targetRepo.Close()
 
-	// Materialize files
-	for relPath, entry := range headTree.Entries {
+	if len(patterns) > 0 {
+		targetRepo.Config.SparsePatterns = patterns
+		_ = targetRepo.SaveConfig()
+	}
+
+	// Materialize files only for sparse selection
+	for relPath, entry := range sparseTree.Entries {
 		data, err := sourceRepo.Store.GetBlobByHash(entry.Hash)
 		if err != nil {
 			continue
@@ -585,13 +781,13 @@ func cmdClone(args []string) {
 		targetRepo.Store.PutBlob(data)
 	}
 
-	// Copy changesets and tree
+	// Copy full tree and changeset to prevent dropping unmanaged monorepo files
 	targetRepo.DB.SaveTree(headTree)
 	targetRepo.DB.SaveChangeset(headCS)
 	targetRepo.DB.UpdateBranchTip(targetRepo.Config.RepoID, "main", headCS.ID, headCS.SequenceNumber)
 
 	elapsed := time.Since(start).Milliseconds()
-	ui.PrintSuccess(fmt.Sprintf("Cloned into %q (%d files materialized) in %dms!", target, len(headTree.Entries), elapsed))
+	ui.PrintSuccess(fmt.Sprintf("Cloned into %q (%d files materialized) in %dms!", target, len(sparseTree.Entries), elapsed))
 }
 
 func cmdServe(args []string) {
@@ -603,6 +799,7 @@ func cmdServe(args []string) {
 	casDirFlag := fs.String("cas-dir", "", "Custom CAS storage path")
 	s3BucketFlag := fs.String("s3-bucket", "", "S3 / MinIO bucket name (or S3_BUCKET env)")
 	s3EndpointFlag := fs.String("s3-endpoint", "", "S3 / MinIO endpoint host (or S3_ENDPOINT env)")
+	authFlag := fs.String("auth-token", "", "Bearer token required for API access (or SCION_AUTH_TOKEN env)")
 	fs.Parse(args)
 
 	finalDB := *dbURL
@@ -652,11 +849,19 @@ func cmdServe(args []string) {
 	defer database.Close()
 
 	server := api.NewServer(database, store)
+	if *authFlag != "" {
+		server.SetAuthToken(*authFlag)
+	}
 
 	fmt.Println()
 	fmt.Printf("%s%sOpenScion Team Server Hub%s\n", ui.Bold, ui.BrightCyan, ui.Reset)
 	fmt.Println("----------------------------------------------------------------")
 	fmt.Printf("• Server Address:   %shttp://0.0.0.0:%s%s\n", ui.BrightGreen, *port, ui.Reset)
+	if *authFlag != "" || os.Getenv("SCION_AUTH_TOKEN") != "" || os.Getenv("AETHER_AUTH_TOKEN") != "" {
+		fmt.Printf("• Authentication:   %sBearer Token Enabled%s\n", ui.BrightGreen, ui.Reset)
+	} else {
+		fmt.Printf("• Authentication:   %sOpen (No Auth)%s\n", ui.Yellow, ui.Reset)
+	}
 	if strings.HasPrefix(finalDB, "postgres://") || strings.HasPrefix(finalDB, "postgresql://") {
 		fmt.Printf("• Database Engine:  %sPostgreSQL / CockroachDB Cluster%s\n", ui.BrightPurple, ui.Reset)
 	} else {
@@ -872,5 +1077,37 @@ func cmdMount(args []string) {
 		ui.PrintError(fmt.Sprintf("VFS mount error: %v", err))
 		os.Exit(1)
 	}
+}
+
+func cmdBench(args []string) {
+	fmt.Printf("%s%s⚡ OpenScion Benchmark Suite%s\n", ui.Bold, ui.BrightCyan, ui.Reset)
+	fmt.Printf("Measuring throughput and latency across Diff Engine, Content Storage, and Merge Queue...\n\n")
+
+	cmd := exec.Command("go", "test", "-bench=.", "-benchmem", "./pkg/merge", "./pkg/queue")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		ui.PrintError(fmt.Sprintf("Benchmark execution encountered an error: %v", err))
+		os.Exit(1)
+	}
+	fmt.Printf("\n%s✔ Benchmarks completed successfully.%s\n", ui.BrightGreen+ui.Bold, ui.Reset)
+}
+
+func cmdGC(args []string) {
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	deleted, freedBytes, err := repo.GC()
+	if err != nil {
+		ui.PrintError(fmt.Sprintf("Garbage collection failed: %v", err))
+		os.Exit(1)
+	}
+
+	ui.PrintSuccess(fmt.Sprintf("Garbage collection complete: pruned %d unreferenced object(s), freed %.2f KB",
+		deleted, float64(freedBytes)/1024.0))
 }
 

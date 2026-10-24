@@ -5,9 +5,10 @@ all: build install
 build:
 	@mkdir -p bin
 	go build -ldflags="-s -w" -o bin/scion ./cmd/scion
+	go build -ldflags="-s -w" -o bin/scn ./cmd/scn
 	go build -ldflags="-s -w" -o bin/aether-server ./cmd/aether-server
 	go build -ldflags="-s -w" -o bin/scnd ./cmd/scnd
-	@which codesign >/dev/null 2>&1 && codesign -s - -f bin/scion bin/aether-server bin/scnd 2>/dev/null || true
+	@which codesign >/dev/null 2>&1 && codesign -s - -f bin/scion bin/scn bin/aether-server bin/scnd 2>/dev/null || true
 	@echo "\033[1;32m✔ Built OpenScion binaries into ./bin\033[0m"
 
 install: build
@@ -19,6 +20,12 @@ install: build
 
 server:
 	./bin/aether-server --port 8080 --data-dir ./data/server
+
+test:
+	go test -v ./...
+
+bench:
+	go test -bench=. -benchmem ./pkg/merge ./pkg/queue
 
 demo:
 	./scripts/demo.sh

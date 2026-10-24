@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -16,21 +17,32 @@ import (
 )
 
 type Server struct {
-	db    *db.DB
-	store *cas.Store
-	queue *queue.MergeQueue
-	mux   *http.ServeMux
+	db        *db.DB
+	store     *cas.Store
+	queue     *queue.MergeQueue
+	mux       *http.ServeMux
+	authToken string
 }
 
 func NewServer(database *db.DB, store *cas.Store) *Server {
+	token := os.Getenv("SCION_AUTH_TOKEN")
+	if token == "" {
+		token = os.Getenv("AETHER_AUTH_TOKEN")
+	}
+
 	s := &Server{
-		db:    database,
-		store: store,
-		queue: queue.NewMergeQueue(database, store),
-		mux:   http.NewServeMux(),
+		db:        database,
+		store:     store,
+		queue:     queue.NewMergeQueue(database, store),
+		mux:       http.NewServeMux(),
+		authToken: token,
 	}
 	s.registerRoutes()
 	return s
+}
+
+func (s *Server) SetAuthToken(token string) {
+	s.authToken = token
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +54,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+
+	// Protect against unbounded memory allocation / OOM attacks (100MB cap)
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20)
+
+	// Bearer token authentication check if enabled
+	if s.authToken != "" && r.URL.Path != "/healthz" && r.URL.Path != "/" {
+		authHeader := r.Header.Get("Authorization")
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if token != s.authToken {
+			writeError(w, http.StatusUnauthorized, "unauthorized: valid Bearer token required")
+			return
+		}
+	}
+
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -57,6 +83,8 @@ func (s *Server) registerRoutes() {
 	// CAS & Storage
 	s.mux.HandleFunc("POST /api/v1/cas/blobs/batch-put", s.handleBatchPutBlobs)
 	s.mux.HandleFunc("POST /api/v1/cas/blobs/batch-get", s.handleBatchGetBlobs)
+	s.mux.HandleFunc("POST /api/v1/cas/manifests/batch-put", s.handleBatchPutManifests)
+	s.mux.HandleFunc("POST /api/v1/cas/manifests/batch-get", s.handleBatchGetManifests)
 	s.mux.HandleFunc("POST /api/v1/cas/trees/put", s.handlePutTree)
 	s.mux.HandleFunc("GET /api/v1/cas/trees/{hash}", s.handleGetTree)
 	s.mux.HandleFunc("GET /api/v1/cas/trees/{hash}/sparse", s.handleGetSparseTree)
@@ -159,16 +187,23 @@ func (s *Server) handleBatchPutBlobs(w http.ResponseWriter, r *http.Request) {
 	for _, cw := range chunks {
 		raw, err := base64.StdEncoding.DecodeString(cw.DataBase64)
 		if err != nil {
-			continue
+			writeError(w, http.StatusBadRequest, "invalid base64 chunk payload")
+			return
 		}
 		c := &cas.BlobChunk{
 			Hash:           cw.Hash,
 			UncompressedSz: cw.UncompressedSz,
 			Data:           raw,
 		}
-		if err := s.store.PutChunk(c); err == nil {
-			saved++
+		if err := cas.ValidateChunk(c); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
+		if err := s.store.PutChunk(c); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		saved++
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"saved_chunks": saved})
@@ -187,13 +222,63 @@ func (s *Server) handleBatchGetBlobs(w http.ResponseWriter, r *http.Request) {
 	for _, h := range req.Hashes {
 		c, err := s.store.GetChunk(h)
 		if err != nil {
-			continue
+			writeError(w, http.StatusNotFound, "chunk not found: "+h)
+			return
 		}
 		results = append(results, ChunkWire{
 			Hash:           c.Hash,
 			UncompressedSz: c.UncompressedSz,
 			DataBase64:     base64.StdEncoding.EncodeToString(c.Data),
 		})
+	}
+
+	writeJSON(w, http.StatusOK, results)
+}
+
+func (s *Server) handleBatchPutManifests(w http.ResponseWriter, r *http.Request) {
+	var manifests []*cas.BlobManifest
+	if err := json.NewDecoder(r.Body).Decode(&manifests); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid manifest payload: "+err.Error())
+		return
+	}
+
+	saved := 0
+	for _, m := range manifests {
+		if m == nil {
+			writeError(w, http.StatusBadRequest, "nil manifest")
+			return
+		}
+		if err := cas.ValidateManifest(m); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.store.SaveManifest(m); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		saved++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"saved_manifests": saved})
+}
+
+func (s *Server) handleBatchGetManifests(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Hashes []string `json:"hashes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	var results []*cas.BlobManifest
+	for _, h := range req.Hashes {
+		m, err := s.store.GetManifest(h)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "manifest not found: "+h)
+			return
+		}
+		results = append(results, m)
 	}
 
 	writeJSON(w, http.StatusOK, results)
@@ -206,6 +291,16 @@ func (s *Server) handlePutTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := t.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for path, entry := range t.Entries {
+		if _, err := s.store.GetBlobByHash(entry.Hash); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("tree entry %s has unavailable content: %v", path, err))
+			return
+		}
+	}
 	t.ComputeHash()
 	if err := s.db.SaveTree(&t); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -469,12 +564,12 @@ func (s *Server) handleQueueStatus(w http.ResponseWriter, r *http.Request) {
 	branch, _ := s.db.GetBranch(repo.ID, "main")
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"repo_name":          repo.Name,
-		"branch":             branch.Name,
-		"current_sequence":   branch.SequenceNumber,
-		"landing_latency_p99": "320ms",
-		"throughput_capacity": "50,000 merges/day",
-		"active_queue_depth": 0,
+		"repo_name":                 repo.Name,
+		"branch":                    branch.Name,
+		"current_sequence":          branch.SequenceNumber,
+		"landing_latency_p99":       "320ms",
+		"throughput_capacity":       "50,000 merges/day",
+		"active_queue_depth":        0,
 		"rebase_speculative_status": "synced",
 	})
 }
@@ -497,4 +592,3 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 	})
 }
-

@@ -12,6 +12,7 @@ import (
 	"github.com/aether/scn/pkg/cas"
 	"github.com/aether/scn/pkg/client"
 	"github.com/aether/scn/pkg/graph"
+	"github.com/aether/scn/pkg/merge"
 	"github.com/aether/scn/pkg/tree"
 	"github.com/aether/scn/pkg/ui"
 	"github.com/google/uuid"
@@ -64,6 +65,8 @@ func main() {
 		cmdQuery(args)
 	case "profile":
 		cmdProfile(args)
+	case "gc":
+		cmdGC(args)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -281,11 +284,16 @@ func cmdClone(args []string) {
 	cfgData, _ := json.MarshalIndent(cfg, "", "  ")
 	os.WriteFile(filepath.Join(targetDir, ".scn", "config.json"), cfgData, 0644)
 
+	manifestTree := t
+	if fullTree, err := cli.GetTree(info.HeadChangeset.RootTreeHash); err == nil {
+		manifestTree = fullTree
+	}
+
 	manifest := Manifest{
 		BaseChangesetID: info.HeadChangeset.ID,
 		HeadChangesetID: info.HeadChangeset.ID,
 		SequenceNumber:  info.SequenceNumber,
-		Tree:            t,
+		Tree:            manifestTree,
 	}
 	manData, _ := json.MarshalIndent(manifest, "", "  ")
 	os.WriteFile(filepath.Join(targetDir, ".scn", "manifest.json"), manData, 0644)
@@ -298,8 +306,8 @@ func cmdStatus(args []string) {
 	cfg, manifest := mustLoadWorkspace()
 	localCAS := mustLoadLocalCAS()
 
-	// Build current tree from disk
-	currentTree, err := tree.BuildTreeFromDir(".", localCAS, nil)
+	// Build current tree from disk with sparse retention
+	currentTree, err := tree.BuildTreeFromDirWithBaseAndSparse(".", localCAS, nil, manifest.Tree, cfg.SparsePatterns)
 	if err != nil {
 		ui.PrintError(fmt.Sprintf("Failed to scan working directory: %v", err))
 		os.Exit(1)
@@ -337,10 +345,10 @@ func cmdStatus(args []string) {
 }
 
 func cmdDiff(args []string) {
-	_, manifest := mustLoadWorkspace()
+	cfg, manifest := mustLoadWorkspace()
 	localCAS := mustLoadLocalCAS()
 
-	currentTree, err := tree.BuildTreeFromDir(".", localCAS, nil)
+	currentTree, err := tree.BuildTreeFromDirWithBaseAndSparse(".", localCAS, nil, manifest.Tree, cfg.SparsePatterns)
 	if err != nil {
 		ui.PrintError(err.Error())
 		os.Exit(1)
@@ -353,9 +361,6 @@ func cmdDiff(args []string) {
 	}
 
 	for _, d := range diffs {
-		fmt.Printf("\n%s--- a/%s%s\n", ui.Red, d.Path, ui.Reset)
-		fmt.Printf("%s+++ b/%s%s\n", ui.Green, d.Path, ui.Reset)
-
 		var oldLines, newLines []string
 		if d.OldHash != "" {
 			oldData, _ := localCAS.GetBlobByHash(d.OldHash)
@@ -366,16 +371,9 @@ func cmdDiff(args []string) {
 			newLines = strings.Split(string(newData), "\n")
 		}
 
-		fmt.Printf("%s@@ -1,%d +1,%d @@%s\n", ui.Cyan, len(oldLines), len(newLines), ui.Reset)
-		for _, l := range oldLines {
-			if l != "" {
-				fmt.Printf("%s-%s%s\n", ui.Red, l, ui.Reset)
-			}
-		}
-		for _, l := range newLines {
-			if l != "" {
-				fmt.Printf("%s+%s%s\n", ui.Green, l, ui.Reset)
-			}
+		diffText := merge.FormatUnifiedDiff(d.Path, oldLines, newLines, true)
+		if diffText != "" {
+			fmt.Println("\n" + strings.TrimSpace(diffText))
 		}
 	}
 }
@@ -396,8 +394,8 @@ func cmdCommit(args []string) {
 	cfg, manifest := mustLoadWorkspace()
 	localCAS := mustLoadLocalCAS()
 
-	// Scan working copy and store blobs in local CAS
-	currentTree, err := tree.BuildTreeFromDir(".", localCAS, nil)
+	// Scan working copy and store blobs in local CAS with sparse retention
+	currentTree, err := tree.BuildTreeFromDirWithBaseAndSparse(".", localCAS, nil, manifest.Tree, cfg.SparsePatterns)
 	if err != nil {
 		ui.PrintError(fmt.Sprintf("Failed to build tree: %v", err))
 		os.Exit(1)
@@ -457,11 +455,13 @@ func cmdSubmit(args []string) {
 	start := time.Now()
 	ui.PrintStep(1, 3, "Uploading new blobs to server CAS")
 
-	// Collect chunks from current tree
+	// Collect chunks and manifests from current tree
 	var chunksToUpload []*cas.BlobChunk
+	var manifestsToUpload []*cas.BlobManifest
 	for _, entry := range manifest.Tree.Entries {
 		man, err := localCAS.GetManifest(entry.Hash)
 		if err == nil {
+			manifestsToUpload = append(manifestsToUpload, man)
 			for _, ch := range man.ChunkHashes {
 				chunk, err := localCAS.GetChunk(ch)
 				if err == nil {
@@ -471,11 +471,19 @@ func cmdSubmit(args []string) {
 		}
 	}
 
-	if err := cli.UploadChunks(chunksToUpload); err != nil {
-		ui.PrintError(fmt.Sprintf("CAS chunk upload failed: %v", err))
-		os.Exit(1)
+	if len(manifestsToUpload) > 0 {
+		if err := cli.UploadManifests(manifestsToUpload); err != nil {
+			ui.PrintError(fmt.Sprintf("CAS manifest upload failed: %v", err))
+			os.Exit(1)
+		}
 	}
-	ui.PrintStepDone(1, 3, fmt.Sprintf("Uploaded %d chunks to CAS", len(chunksToUpload)))
+	if len(chunksToUpload) > 0 {
+		if err := cli.UploadChunks(chunksToUpload); err != nil {
+			ui.PrintError(fmt.Sprintf("CAS chunk upload failed: %v", err))
+			os.Exit(1)
+		}
+	}
+	ui.PrintStepDone(1, 3, fmt.Sprintf("Uploaded %d chunks, %d manifests to CAS", len(chunksToUpload), len(manifestsToUpload)))
 
 	ui.PrintStep(2, 3, "Registering Merkle tree on server")
 	if err := cli.SaveTree(manifest.Tree); err != nil {
@@ -694,4 +702,32 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func cmdGC(args []string) {
+	_, manifest := mustLoadWorkspace()
+	localCAS := mustLoadLocalCAS()
+
+	reachable := make(map[string]bool)
+	if manifest.Tree != nil {
+		for _, entry := range manifest.Tree.Entries {
+			reachable[entry.Hash] = true
+			man, err := localCAS.GetManifest(entry.Hash)
+			if err == nil {
+				reachable[man.BlobHash] = true
+				for _, ch := range man.ChunkHashes {
+					reachable[ch] = true
+				}
+			}
+		}
+	}
+
+	deleted, freedBytes, err := localCAS.GC(reachable)
+	if err != nil {
+		ui.PrintError(fmt.Sprintf("Garbage collection failed: %v", err))
+		os.Exit(1)
+	}
+
+	ui.PrintSuccess(fmt.Sprintf("Garbage collection complete: pruned %d unreferenced object(s), freed %.2f KB",
+		deleted, float64(freedBytes)/1024.0))
 }

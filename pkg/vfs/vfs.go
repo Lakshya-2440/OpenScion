@@ -54,25 +54,102 @@ type MerkleFS struct {
 	hydratedMu    sync.Mutex
 	hydratedFiles map[string]int64
 	bytesServed   int64
+
+	// bounded cache (RAM + optional disk cache)
+	cacheMu        sync.RWMutex
+	blobCache      map[string][]byte
+	cacheOrder     []string
+	maxCacheBytes  int64
+	currCacheBytes int64
+	cacheDir       string
 }
 
 // NewMerkleFS builds in-memory directory index from Merkle tree
-func NewMerkleFS(t *tree.Tree, store *cas.Store, commitTime time.Time) *MerkleFS {
+func NewMerkleFS(t *tree.Tree, store *cas.Store, commitTime time.Time, opts ...MountOptions) *MerkleFS {
 	if commitTime.IsZero() {
 		commitTime = time.Now()
 	}
 
+	maxCache := int64(128 * 1024 * 1024) // 128 MB default RAM cache
+	var cacheDir string
+	if len(opts) > 0 {
+		if opts[0].MaxCacheMB > 0 {
+			maxCache = int64(opts[0].MaxCacheMB) * 1024 * 1024
+		}
+		cacheDir = opts[0].CacheDir
+	}
+
 	fs := &MerkleFS{
-		tree:          t,
-		store:         store,
-		modTime:       commitTime,
-		dirTree:       make(map[string][]string),
-		files:         make(map[string]tree.Entry),
-		hydratedFiles: make(map[string]int64),
+		tree:           t,
+		store:          store,
+		modTime:        commitTime,
+		dirTree:        make(map[string][]string),
+		files:          make(map[string]tree.Entry),
+		hydratedFiles:  make(map[string]int64),
+		blobCache:      make(map[string][]byte),
+		maxCacheBytes:  maxCache,
+		cacheDir:       cacheDir,
 	}
 
 	fs.indexTree()
 	return fs
+}
+
+func (fs *MerkleFS) getOrHydrateBlob(hash string) ([]byte, error) {
+	fs.cacheMu.Lock()
+	defer fs.cacheMu.Unlock()
+
+	if content, ok := fs.blobCache[hash]; ok {
+		return content, nil
+	}
+
+	// Check disk cache if cacheDir configured
+	if fs.cacheDir != "" {
+		diskPath := filepath.Join(fs.cacheDir, hash)
+		if data, err := os.ReadFile(diskPath); err == nil && len(data) > 0 {
+			fs.putCacheLocked(hash, data)
+			return data, nil
+		}
+	}
+
+	content, err := fs.store.GetBlobByHash(hash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Persist to disk cache atomically if configured
+	if fs.cacheDir != "" {
+		_ = os.MkdirAll(fs.cacheDir, 0755)
+		tmpFile := filepath.Join(fs.cacheDir, fmt.Sprintf("%s.tmp.%d", hash, time.Now().UnixNano()))
+		if err := os.WriteFile(tmpFile, content, 0644); err == nil {
+			_ = os.Rename(tmpFile, filepath.Join(fs.cacheDir, hash))
+		}
+	}
+
+	fs.putCacheLocked(hash, content)
+	return content, nil
+}
+
+func (fs *MerkleFS) putCacheLocked(hash string, data []byte) {
+	if _, exists := fs.blobCache[hash]; exists {
+		return
+	}
+
+	dataLen := int64(len(data))
+	for fs.currCacheBytes+dataLen > fs.maxCacheBytes && len(fs.cacheOrder) > 0 {
+		oldest := fs.cacheOrder[0]
+		fs.cacheOrder = fs.cacheOrder[1:]
+		if oldData, ok := fs.blobCache[oldest]; ok {
+			fs.currCacheBytes -= int64(len(oldData))
+			delete(fs.blobCache, oldest)
+		}
+	}
+
+	if dataLen <= fs.maxCacheBytes {
+		fs.blobCache[hash] = data
+		fs.cacheOrder = append(fs.cacheOrder, hash)
+		fs.currCacheBytes += dataLen
+	}
 }
 
 func cleanPath(p string) string {
@@ -181,6 +258,10 @@ func (fs *MerkleFS) Stat(ctx context.Context, name string) (os.FileInfo, error) 
 }
 
 func (fs *MerkleFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0 {
+		return nil, os.ErrPermission
+	}
+
 	rel := cleanPath(name)
 
 	fs.dirsMu.RLock()
@@ -233,9 +314,9 @@ func (fs *MerkleFS) OpenFile(ctx context.Context, name string, flag int, perm os
 	}
 
 	if isFile {
-		// Lazy-hydrate file from CAS chunks on-demand
+		// Lazy-hydrate file from CAS chunks on-demand with bounded cache
 		start := time.Now()
-		content, err := fs.store.GetBlobByHash(entry.Hash)
+		content, err := fs.getOrHydrateBlob(entry.Hash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to hydrate blob %s: %w", entry.Hash, err)
 		}
@@ -273,6 +354,7 @@ func (fs *MerkleFS) Stats() (int, int64) {
 
 // VirtualDirHandle implements webdav.File for directories
 type VirtualDirHandle struct {
+	mu      sync.Mutex
 	info    *VirtualFileInfo
 	entries []os.FileInfo
 	pos     int
@@ -283,9 +365,16 @@ func (d *VirtualDirHandle) Read(p []byte) (int, error) {
 	return 0, io.EOF
 }
 func (d *VirtualDirHandle) Seek(offset int64, whence int) (int64, error) {
-	return 0, nil
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if whence == io.SeekStart {
+		d.pos = int(offset)
+	}
+	return int64(d.pos), nil
 }
 func (d *VirtualDirHandle) Readdir(count int) ([]os.FileInfo, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.pos >= len(d.entries) {
 		if count <= 0 {
 			return nil, nil
@@ -316,15 +405,20 @@ func (d *VirtualDirHandle) Write(p []byte) (int, error) {
 
 // VirtualFileHandle implements webdav.File for read-only hydrated files
 type VirtualFileHandle struct {
+	mu     sync.Mutex
 	info   *VirtualFileInfo
 	reader *bytes.Reader
 }
 
 func (f *VirtualFileHandle) Close() error { return nil }
 func (f *VirtualFileHandle) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.reader.Read(p)
 }
 func (f *VirtualFileHandle) Seek(offset int64, whence int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.reader.Seek(offset, whence)
 }
 func (f *VirtualFileHandle) Readdir(count int) ([]os.FileInfo, error) {
@@ -342,11 +436,13 @@ type MountOptions struct {
 	MountPoint string
 	CommitSeq  int64
 	ReadOnly   bool
+	CacheDir   string
+	MaxCacheMB int
 }
 
 // Mount starts the virtual filesystem server and mounts it locally
 func Mount(t *tree.Tree, store *cas.Store, commitTime time.Time, opts MountOptions) error {
-	fs := NewMerkleFS(t, store, commitTime)
+	fs := NewMerkleFS(t, store, commitTime, opts)
 
 	// Bind to an open ephemeral port on 127.0.0.1
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -398,6 +494,7 @@ func Mount(t *tree.Tree, store *cas.Store, commitTime time.Time, opts MountOptio
 
 	// Attempt OS-specific mount
 	mounted := false
+	var windowsMappedDrive string
 	if runtime.GOOS == "darwin" {
 		// Use macOS mount_webdav -S (suppress UI dialogs and run non-interactively)
 		cmd := exec.Command("/sbin/mount_webdav", "-S", webdavURL, absMountPoint)
@@ -424,7 +521,16 @@ func Mount(t *tree.Tree, store *cas.Store, commitTime time.Time, opts MountOptio
 		cmd := exec.Command("net", "use", "*", webdavURL)
 		if out, err := cmd.Output(); err == nil {
 			mounted = true
-			fmt.Printf("\033[32m✓ Mounted natively via Windows WebDAV network drive: %s\033[0m\n", strings.TrimSpace(string(out)))
+			outStr := strings.TrimSpace(string(out))
+			// Extract mapped drive letter (e.g., "Drive Z: is now connected...")
+			fields := strings.Fields(outStr)
+			for _, f := range fields {
+				if len(f) == 2 && f[1] == ':' && (('A' <= f[0] && f[0] <= 'Z') || ('a' <= f[0] && f[0] <= 'z')) {
+					windowsMappedDrive = f
+					break
+				}
+			}
+			fmt.Printf("\033[32m✓ Mounted natively via Windows WebDAV network drive: %s\033[0m\n", outStr)
 		}
 	}
 
@@ -438,7 +544,7 @@ func Mount(t *tree.Tree, store *cas.Store, commitTime time.Time, opts MountOptio
 		}
 	}
 
-	fmt.Println("\n\033[2mStreaming filesystem active. Press Ctrl+C to unmount...\033[0m\n")
+	fmt.Printf("\n\033[2mStreaming filesystem active. Press Ctrl+C to unmount...\033[0m\n\n")
 
 	// Setup signal handler for graceful unmount
 	sigChan := make(chan os.Signal, 1)
@@ -459,7 +565,11 @@ func Mount(t *tree.Tree, store *cas.Store, commitTime time.Time, opts MountOptio
 		} else if runtime.GOOS == "linux" {
 			_ = exec.Command("umount", absMountPoint).Run()
 		} else if runtime.GOOS == "windows" {
-			_ = exec.Command("net", "use", "*", "/delete", "/y").Run()
+			if windowsMappedDrive != "" {
+				_ = exec.Command("net", "use", windowsMappedDrive, "/delete", "/y").Run()
+			} else {
+				_ = exec.Command("net", "use", webdavURL, "/delete", "/y").Run()
+			}
 		}
 	}
 

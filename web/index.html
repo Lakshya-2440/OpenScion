@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>OpenScion — Agent-Scale Terminal Version Control System</title>
   <meta name="description" content="The version control system built for autonomous AI coding agents (Claude Code, Cursor, SWE-bench) and hyper-scale monorepos.">
-  <link rel="stylesheet" href="style.css">
+  <base href="/">
+  <link rel="stylesheet" href="/style.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2'><path d='M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5'/></svg>">
 </head>
 <body>
@@ -13,7 +14,7 @@
   <!-- Minimalist Navbar -->
   <header class="site-header" role="banner">
     <div class="container">
-      <a href="#" class="brand" aria-label="OpenScion Homepage">
+      <a href="/" class="brand" aria-label="OpenScion Homepage">
         <div class="brand-icon">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
@@ -26,9 +27,11 @@
 
       <nav aria-label="Main Navigation">
         <ul class="nav-links">
-          <li><a href="#architecture-section" class="nav-link">Architecture</a></li>
-          <li><a href="#merge-queue-section" class="nav-link">Merge Queue</a></li>
-          <li><a href="#cli-reference-section" class="nav-link">CLI Reference</a></li>
+          <li><a href="/terminal" class="nav-link" data-section="terminal">Terminal</a></li>
+          <li><a href="/architecture" class="nav-link" data-section="architecture">Architecture</a></li>
+          <li><a href="/queue" class="nav-link" data-section="queue">Merge Queue</a></li>
+          <li><a href="/compare" class="nav-link" data-section="compare">Git vs Scion</a></li>
+          <li><a href="/cli" class="nav-link" data-section="cli">CLI Reference</a></li>
         </ul>
       </nav>
 
@@ -192,7 +195,7 @@
       </div>
 
       <!-- Live Terminal Simulator -->
-      <div class="terminal-block" id="hero-terminal" role="region" aria-label="OpenScion Terminal Simulator">
+      <div class="terminal-block" id="terminal" role="region" aria-label="OpenScion Terminal Simulator">
         <div class="terminal-titlebar">
           <div class="terminal-window-buttons">
             <span class="win-dot"></span>
@@ -252,7 +255,7 @@
   </section>
 
   <!-- Architecture Section -->
-  <section class="section-pad" id="architecture-section">
+  <section class="section-pad" id="architecture">
     <div class="container">
       <div class="section-header">
         <span class="section-tag">System Architecture</span>
@@ -320,7 +323,7 @@
   </section>
 
   <!-- Speculative Merge Queue Section -->
-  <section class="section-pad" id="merge-queue-section">
+  <section class="section-pad" id="queue">
     <div class="container">
       <div class="section-header">
         <span class="section-tag">High-Throughput Simulation</span>
@@ -404,7 +407,7 @@
   </section>
 
   <!-- 0-Byte Ghost VFS Section -->
-  <section class="section-pad" id="ghost-vfs-section">
+  <section class="section-pad" id="vfs">
     <div class="container">
       <div class="section-header">
         <span class="section-tag">Virtual Filesystem</span>
@@ -530,7 +533,7 @@
   </section>
 
   <!-- Comparison Section -->
-  <section class="section-pad" id="comparison-section">
+  <section class="section-pad" id="compare">
     <div class="container">
       <div class="section-header">
         <span class="section-tag">Comparison Matrix</span>
@@ -597,7 +600,7 @@
   </section>
 
   <!-- CLI Reference Section -->
-  <section class="section-pad" id="cli-reference-section">
+  <section class="section-pad" id="cli">
     <div class="container">
       <div class="section-header">
         <span class="section-tag">Command Line Interface</span>
@@ -698,7 +701,7 @@
     <div class="container">
       <div class="footer-top">
         <div>
-          <div class="brand">
+          <a href="/" class="brand" style="text-decoration:none;">
             <div class="brand-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
                 <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
@@ -707,7 +710,7 @@
               </svg>
             </div>
             <span>OpenScion</span>
-          </div>
+          </a>
           <p class="footer-brand-desc">
             Agent-Scale Terminal Version Control System. Engineered for AI coding agents and massive engineering monorepos.
           </p>
@@ -717,10 +720,10 @@
           <div class="footer-col">
             <h5>Product</h5>
             <ul>
-              <li><a href="#hero-terminal">Terminal</a></li>
-              <li><a href="#merge-queue-section">Merge Queue</a></li>
-              <li><a href="#ghost-vfs-section">0-Byte VFS</a></li>
-              <li><a href="#comparison-section">Comparison</a></li>
+              <li><a href="/terminal" data-section="terminal">Terminal</a></li>
+              <li><a href="/queue" data-section="queue">Merge Queue</a></li>
+              <li><a href="/vfs" data-section="vfs">0-Byte VFS</a></li>
+              <li><a href="/compare" data-section="compare">Comparison</a></li>
             </ul>
           </div>
           <div class="footer-col">
@@ -769,9 +772,9 @@
   </div>
 
   <!-- Scripts -->
-  <script src="terminal.js"></script>
-  <script src="queue-sim.js"></script>
-  <script src="vfs-sim.js"></script>
-  <script src="app.js"></script>
+  <script src="/terminal.js"></script>
+  <script src="/queue-sim.js"></script>
+  <script src="/vfs-sim.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>

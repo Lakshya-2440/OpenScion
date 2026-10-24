@@ -58,6 +58,20 @@ func Open(dataSource string) (*DB, error) {
 		sqlDB.SetMaxOpenConns(50)
 		sqlDB.SetMaxIdleConns(25)
 	} else {
+		if !strings.Contains(dataSource, "_pragma=busy_timeout") && !strings.Contains(dataSource, "_busy_timeout") {
+			if strings.Contains(dataSource, "?") {
+				dataSource += "&_pragma=busy_timeout(10000)"
+			} else {
+				dataSource += "?_pragma=busy_timeout(10000)"
+			}
+		}
+		if !strings.Contains(dataSource, ":memory:") && !strings.Contains(dataSource, "mode=memory") && !strings.Contains(dataSource, "_pragma=journal_mode") {
+			if strings.Contains(dataSource, "?") {
+				dataSource += "&_pragma=journal_mode(wal)"
+			} else {
+				dataSource += "?_pragma=journal_mode(wal)"
+			}
+		}
 		sqlDB, err = sql.Open("sqlite", dataSource)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open database: %w", err)
@@ -88,6 +102,10 @@ func (d *DB) rebind(query string) string {
 	if strings.Contains(query, "INSERT INTO changesets (") && !strings.Contains(query, "ON CONFLICT") {
 		query += " ON CONFLICT (id) DO UPDATE SET sequence_number = EXCLUDED.sequence_number, root_tree_hash = EXCLUDED.root_tree_hash"
 	}
+	query = strings.ReplaceAll(query, "INSERT OR REPLACE INTO sparse_profiles (", "INSERT INTO sparse_profiles (")
+	if strings.Contains(query, "INSERT INTO sparse_profiles (") && !strings.Contains(query, "ON CONFLICT") {
+		query += " ON CONFLICT (id) DO UPDATE SET included_patterns = EXCLUDED.included_patterns"
+	}
 
 	var b strings.Builder
 	paramIdx := 1
@@ -103,7 +121,26 @@ func (d *DB) rebind(query string) string {
 }
 
 func (d *DB) exec(query string, args ...any) (sql.Result, error) {
-	return d.sqlDB.Exec(d.rebind(query), args...)
+	reb := d.rebind(query)
+	var lastErr error
+	for attempt := 0; attempt < 40; attempt++ {
+		res, err := d.sqlDB.Exec(reb, args...)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		errText := strings.ToLower(err.Error())
+		if strings.Contains(errText, "locked") || strings.Contains(errText, "busy") {
+			delay := 10 * time.Millisecond * time.Duration(attempt+1)
+			if delay > 250*time.Millisecond {
+				delay = 250 * time.Millisecond
+			}
+			time.Sleep(delay)
+			continue
+		}
+		return nil, err
+	}
+	return nil, lastErr
 }
 
 func (d *DB) queryRow(query string, args ...any) *sql.Row {
@@ -126,6 +163,7 @@ func (d *DB) initSchema() error {
 	queries := []string{
 		`PRAGMA journal_mode=WAL;`,
 		`PRAGMA synchronous=NORMAL;`,
+		`PRAGMA busy_timeout=10000;`,
 		`CREATE TABLE IF NOT EXISTS repositories (
 			id TEXT PRIMARY KEY,
 			name TEXT UNIQUE NOT NULL,
@@ -185,7 +223,6 @@ func (d *DB) initSchema() error {
 	}
 	return nil
 }
-
 
 // CreateRepo creates a new repository and initial empty main branch
 func (d *DB) CreateRepo(name string) (*Repository, error) {
@@ -298,11 +335,57 @@ func (d *DB) GetBranch(repoID, branchName string) (*Branch, error) {
 	return &b, nil
 }
 
+func (d *DB) ListBranches(repoID string) ([]Branch, error) {
+	rows, err := d.query(`SELECT repo_id, name, head_changeset_id, sequence_number, updated_at
+		FROM branches WHERE repo_id = ? ORDER BY name ASC`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var branches []Branch
+	for rows.Next() {
+		var b Branch
+		if err := rows.Scan(&b.RepoID, &b.Name, &b.HeadID, &b.SequenceNumber, &b.UpdatedAt); err == nil {
+			branches = append(branches, b)
+		}
+	}
+	return branches, nil
+}
+
+func (d *DB) CreateBranch(repoID, branchName, headID string, seq int64) error {
+	now := time.Now().Unix()
+	_, err := d.exec(`INSERT INTO branches (repo_id, name, head_changeset_id, sequence_number, updated_at)
+		VALUES (?, ?, ?, ?, ?)`, repoID, branchName, headID, seq, now)
+	return err
+}
+
+func (d *DB) DeleteBranch(repoID, branchName string) error {
+	_, err := d.exec(`DELETE FROM branches WHERE repo_id = ? AND name = ?`, repoID, branchName)
+	return err
+}
+
 func (d *DB) UpdateBranchTip(repoID, branchName, newHeadID string, newSeq int64) error {
 	now := time.Now().Unix()
 	_, err := d.exec(`UPDATE branches SET head_changeset_id = ?, sequence_number = ?, updated_at = ?
 		WHERE repo_id = ? AND name = ?`, newHeadID, newSeq, now, repoID, branchName)
 	return err
+}
+
+// CompareAndSwapBranchTip atomically updates a branch tip only if current head and sequence match expected
+func (d *DB) CompareAndSwapBranchTip(repoID, branchName, expectedHeadID string, expectedSeq int64, newHeadID string, newSeq int64) (bool, error) {
+	now := time.Now().Unix()
+	res, err := d.exec(`UPDATE branches SET head_changeset_id = ?, sequence_number = ?, updated_at = ?
+		WHERE repo_id = ? AND name = ? AND head_changeset_id = ? AND sequence_number = ?`,
+		newHeadID, newSeq, now, repoID, branchName, expectedHeadID, expectedSeq)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 func (d *DB) SaveTree(t *tree.Tree) error {
@@ -402,7 +485,6 @@ func (d *DB) GetChangesetBySequence(repoID string, seq int64) (*graph.Changeset,
 	return &cs, nil
 }
 
-
 func (d *DB) GetChangesetsByRepo(repoID string, limit int) ([]graph.Changeset, error) {
 	if limit <= 0 {
 		limit = 50
@@ -478,3 +560,42 @@ func (d *DB) GetSparseProfiles(repoID string) ([]SparseProfile, error) {
 	return profiles, nil
 }
 
+type MergeQueueEntry struct {
+	ID                string `json:"id"`
+	RepoID            string `json:"repo_id"`
+	ChangesetID       string `json:"changeset_id"`
+	Status            string `json:"status"`
+	SpeculativeParent string `json:"speculative_parent,omitempty"`
+	EnqueuedAt        int64  `json:"enqueued_at"`
+	LandedAt          int64  `json:"landed_at,omitempty"`
+}
+
+func (d *DB) EnqueueMerge(id, repoID, changesetID, speculativeParent string) error {
+	now := time.Now().Unix()
+	_, err := d.exec(`INSERT INTO merge_queue (id, repo_id, changeset_id, status, speculative_parent, enqueued_at)
+		VALUES (?, ?, ?, 'ENQUEUED', ?, ?)`, id, repoID, changesetID, speculativeParent, now)
+	return err
+}
+
+func (d *DB) UpdateMergeQueueStatus(id string, status string, landedAt int64) error {
+	_, err := d.exec(`UPDATE merge_queue SET status = ?, landed_at = ? WHERE id = ?`, status, landedAt, id)
+	return err
+}
+
+func (d *DB) GetMergeQueueEntry(id string) (*MergeQueueEntry, error) {
+	row := d.queryRow(`SELECT id, repo_id, changeset_id, status, speculative_parent, enqueued_at, landed_at
+		FROM merge_queue WHERE id = ?`, id)
+	var e MergeQueueEntry
+	var specParent sql.NullString
+	var landedAt sql.NullInt64
+	if err := row.Scan(&e.ID, &e.RepoID, &e.ChangesetID, &e.Status, &specParent, &e.EnqueuedAt, &landedAt); err != nil {
+		return nil, err
+	}
+	if specParent.Valid {
+		e.SpeculativeParent = specParent.String
+	}
+	if landedAt.Valid {
+		e.LandedAt = landedAt.Int64
+	}
+	return &e, nil
+}

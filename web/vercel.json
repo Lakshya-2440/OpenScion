@@ -1,4 +1,14 @@
 {
   "name": "openscion",
-  "cleanUrls": true
+  "cleanUrls": true,
+  "rewrites": [
+    {
+      "source": "/(terminal|architecture|queue|vfs|compare|cli)",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/(architecture-section|merge-queue-section|cli-reference-section|ghost-vfs-section|comparison-section|hero-terminal)",
+      "destination": "/index.html"
+    }
+  ]
 }

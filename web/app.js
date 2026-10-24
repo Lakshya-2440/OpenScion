@@ -190,6 +190,191 @@ scion serve --port 8080 --db "$DATABASE_URL"`
     });
   });
 
+  // 6. Section Navigation & Clean URL Router (HTML5 History API)
+  const SECTION_MAP = {
+    'terminal': 'terminal',
+    'hero-terminal': 'terminal',
+    'architecture': 'architecture',
+    'architecture-section': 'architecture',
+    'queue': 'queue',
+    'merge-queue': 'queue',
+    'merge-queue-section': 'queue',
+    'vfs': 'vfs',
+    'ghost-vfs': 'vfs',
+    'ghost-vfs-section': 'vfs',
+    'compare': 'compare',
+    'comparison': 'compare',
+    'comparison-section': 'compare',
+    'cli': 'cli',
+    'cli-reference': 'cli',
+    'cli-reference-section': 'cli'
+  };
+
+  const navLinks = document.querySelectorAll('.nav-links .nav-link');
+  let isNavScrolling = false;
+  let navScrollTimeout = null;
+
+  function updateActiveNavLink(sectionId) {
+    navLinks.forEach(link => {
+      const target = link.dataset.section || link.getAttribute('href')?.replace(/^\//, '');
+      if (target === sectionId) {
+        link.classList.add('active');
+      } else {
+        link.classList.remove('active');
+      }
+    });
+  }
+
+  function scrollToSection(key, updateUrl = true, pushHistory = true) {
+    if (!key || key === 'home' || key === '/' || key === '#') {
+      isNavScrolling = true;
+      clearTimeout(navScrollTimeout);
+      navScrollTimeout = setTimeout(() => { isNavScrolling = false; }, 800);
+
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      updateActiveNavLink('');
+      if (updateUrl && window.location.pathname !== '/') {
+        if (pushHistory) {
+          history.pushState({ section: '' }, '', '/');
+        } else {
+          history.replaceState({ section: '' }, '', '/');
+        }
+      }
+      return;
+    }
+
+    const cleanKey = SECTION_MAP[key] || key;
+    const targetEl = document.getElementById(cleanKey) || document.getElementById(key);
+
+    if (targetEl) {
+      isNavScrolling = true;
+      clearTimeout(navScrollTimeout);
+      navScrollTimeout = setTimeout(() => { isNavScrolling = false; }, 800);
+
+      targetEl.scrollIntoView({ behavior: 'smooth' });
+      updateActiveNavLink(cleanKey);
+
+      if (updateUrl && window.location.pathname !== '/' + cleanKey) {
+        if (pushHistory) {
+          history.pushState({ section: cleanKey }, '', '/' + cleanKey);
+        } else {
+          history.replaceState({ section: cleanKey }, '', '/' + cleanKey);
+        }
+      }
+    }
+  }
+
+  // Intercept clicks on links for smooth client-side routing without '#'
+  document.addEventListener('click', (e) => {
+    const link = e.target.closest('a');
+    if (!link) return;
+
+    if (link.classList.contains('brand') || link.getAttribute('href') === '/') {
+      e.preventDefault();
+      scrollToSection('home');
+      return;
+    }
+
+    const dataSection = link.dataset.section;
+    const href = link.getAttribute('href');
+
+    if (dataSection && SECTION_MAP[dataSection]) {
+      e.preventDefault();
+      scrollToSection(dataSection);
+      return;
+    }
+
+    if (href) {
+      if (href.startsWith('/') && !href.startsWith('//') && !href.includes('.') && href.length > 1) {
+        const pathSlug = href.substring(1);
+        if (SECTION_MAP[pathSlug]) {
+          e.preventDefault();
+          scrollToSection(pathSlug);
+          return;
+        }
+      } else if (href.startsWith('#') && href.length > 1) {
+        const hashSlug = href.substring(1);
+        if (SECTION_MAP[hashSlug]) {
+          e.preventDefault();
+          scrollToSection(hashSlug);
+          return;
+        }
+      }
+    }
+  });
+
+  // Browser Back / Forward buttons
+  window.addEventListener('popstate', () => {
+    const path = window.location.pathname.replace(/^\/|\/$/g, '');
+    if (!path) {
+      scrollToSection('home', false);
+    } else if (SECTION_MAP[path]) {
+      scrollToSection(SECTION_MAP[path], false);
+    }
+  });
+
+  // ScrollSpy with IntersectionObserver: updates URL and navbar indicator on scroll
+  const observerSections = ['terminal', 'architecture', 'queue', 'vfs', 'compare', 'cli'];
+  const sectionEls = observerSections
+    .map(id => document.getElementById(id))
+    .filter(Boolean);
+
+  if ('IntersectionObserver' in window && sectionEls.length > 0) {
+    const observer = new IntersectionObserver((entries) => {
+      if (isNavScrolling) return;
+
+      entries.forEach(entry => {
+        if (entry.isIntersecting && entry.intersectionRatio >= 0.35) {
+          const id = entry.target.id;
+          const cleanId = SECTION_MAP[id] || id;
+          updateActiveNavLink(cleanId);
+          if (window.location.pathname !== '/' + cleanId) {
+            history.replaceState({ section: cleanId }, '', '/' + cleanId);
+          }
+        }
+      });
+    }, {
+      rootMargin: '-10% 0px -50% 0px',
+      threshold: [0.35]
+    });
+
+    sectionEls.forEach(el => observer.observe(el));
+
+    window.addEventListener('scroll', () => {
+      if (isNavScrolling) return;
+      if (window.pageYOffset < 150 && window.location.pathname !== '/') {
+        updateActiveNavLink('');
+        history.replaceState({ section: '' }, '', '/');
+      }
+    }, { passive: true });
+  }
+
+  // Handle initial page load with clean route or legacy hash
+  function handleInitialRoute() {
+    const path = window.location.pathname.replace(/^\/|\/$/g, '');
+    const hash = window.location.hash.replace(/^#/, '');
+
+    let initialSection = null;
+    if (path && SECTION_MAP[path]) {
+      initialSection = SECTION_MAP[path];
+    } else if (hash && SECTION_MAP[hash]) {
+      initialSection = SECTION_MAP[hash];
+      history.replaceState({ section: initialSection }, '', '/' + initialSection);
+    }
+
+    if (initialSection) {
+      setTimeout(() => {
+        scrollToSection(initialSection, false);
+      }, 120);
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', handleInitialRoute);
+  } else {
+    handleInitialRoute();
+  }
+
   // 7. Command Palette Modal (Cmd+K / Ctrl+K / '/' trigger)
   const cmdPaletteBackdrop = document.getElementById('cmd-palette-backdrop');
   const cmdPaletteInput = document.getElementById('cmd-palette-input');
@@ -207,11 +392,11 @@ scion serve --port 8080 --db "$DATABASE_URL"`
       navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/Lakshya-2440/OpenScion/main/install.sh | bash');
       window.showToast('Copied curl install command');
     }},
-    { title: 'Jump to Speculative Merge Queue Visualizer', category: 'Navigation', action: () => document.getElementById('merge-queue-section').scrollIntoView({ behavior: 'smooth' }) },
-    { title: 'Jump to 0-Byte Ghost VFS Explorer', category: 'Navigation', action: () => document.getElementById('ghost-vfs-section').scrollIntoView({ behavior: 'smooth' }) },
-    { title: 'Jump to Architectural Deep Dive', category: 'Navigation', action: () => document.getElementById('architecture-section').scrollIntoView({ behavior: 'smooth' }) },
-    { title: 'Jump to Git vs OpenScion Comparison', category: 'Navigation', action: () => document.getElementById('comparison-section').scrollIntoView({ behavior: 'smooth' }) },
-    { title: 'Jump to CLI Command Reference', category: 'Navigation', action: () => document.getElementById('cli-reference-section').scrollIntoView({ behavior: 'smooth' }) },
+    { title: 'Jump to Speculative Merge Queue Visualizer', category: 'Navigation', action: () => scrollToSection('queue') },
+    { title: 'Jump to 0-Byte Ghost VFS Explorer', category: 'Navigation', action: () => scrollToSection('vfs') },
+    { title: 'Jump to Architectural Deep Dive', category: 'Navigation', action: () => scrollToSection('architecture') },
+    { title: 'Jump to Git vs OpenScion Comparison', category: 'Navigation', action: () => scrollToSection('compare') },
+    { title: 'Jump to CLI Command Reference', category: 'Navigation', action: () => scrollToSection('cli') },
     { title: 'View OpenScion GitHub Repository', category: 'External', action: () => window.open('https://github.com/Lakshya-2440/OpenScion', '_blank') }
   ];
 

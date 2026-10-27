@@ -1,8 +1,10 @@
 package local
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -440,5 +442,184 @@ func TestSync_PushAndPullProtectedRebase(t *testing.T) {
 		t.Errorf("repo1 missing file2.txt from repo2: %v, %s", err, string(c2Repo1))
 	}
 	_ = csLocal2
+}
+
+func TestSync_ConflictMarkersWrittenToFile(t *testing.T) {
+	// 1. Setup mock remote server
+	serverDir := t.TempDir()
+	serverDB, err := db.Open(filepath.Join(serverDir, "server.db"))
+	if err != nil {
+		t.Fatalf("failed to init server db: %v", err)
+	}
+	defer serverDB.Close()
+
+	serverCAS, err := cas.NewStore(filepath.Join(serverDir, "cas"))
+	if err != nil {
+		t.Fatalf("failed to init server cas: %v", err)
+	}
+
+	server := api.NewServer(serverDB, serverCAS)
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+
+	// 2. Repo 1 init, commit base file, and push
+	dir1 := t.TempDir()
+	repo1, err := InitLocalRepo(dir1, "conflictrepo")
+	if err != nil {
+		t.Fatalf("repo1 init failed: %v", err)
+	}
+	defer repo1.Close()
+	_ = repo1.SetRemote(ts.URL)
+
+	baseFile := filepath.Join(dir1, "config.ini")
+	_ = os.WriteFile(baseFile, []byte("port = 8080\nworkers = 4\nenv = prod\n"), 0644)
+	if _, err := repo1.Commit("base config", "Dev1", "", "", ""); err != nil {
+		t.Fatalf("repo1 commit failed: %v", err)
+	}
+	if _, err := repo1.Push(); err != nil {
+		t.Fatalf("repo1 push failed: %v", err)
+	}
+
+	// 3. Repo 2 init and pull base
+	dir2 := t.TempDir()
+	repo2, err := InitLocalRepo(dir2, "conflictrepo")
+	if err != nil {
+		t.Fatalf("repo2 init failed: %v", err)
+	}
+	defer repo2.Close()
+	_ = repo2.SetRemote(ts.URL)
+
+	_ = os.Remove(filepath.Join(dir2, "AGENTS.md"))
+	_ = os.Remove(filepath.Join(dir2, "CLAUDE.md"))
+
+	if _, err := repo2.Pull(); err != nil {
+		t.Fatalf("repo2 initial pull failed: %v", err)
+	}
+
+	// 4. Repo 1 modifies line 2, commits, and pushes to server (lands)
+	_ = os.WriteFile(baseFile, []byte("port = 8080\nworkers = 16\nenv = prod\n"), 0644)
+	if _, err := repo1.Commit("scale workers to 16", "Dev1", "", "", ""); err != nil {
+		t.Fatalf("repo1 second commit failed: %v", err)
+	}
+	if _, err := repo1.Push(); err != nil {
+		t.Fatalf("repo1 second push failed: %v", err)
+	}
+
+	// 5. Repo 2 concurrently modifies line 2 to conflicting value, commits LOCALLY
+	f2 := filepath.Join(dir2, "config.ini")
+	_ = os.WriteFile(f2, []byte("port = 8080\nworkers = 32\nenv = prod\n"), 0644)
+	if _, err := repo2.Commit("scale workers to 32", "Dev2", "", "", ""); err != nil {
+		t.Fatalf("repo2 commit failed: %v", err)
+	}
+
+	// 6. Repo 2 pushes -> MUST be rejected with conflict AND write conflict markers to config.ini on disk!
+	_, pushErr := repo2.Push()
+	if pushErr == nil {
+		t.Fatalf("expected push to be rejected due to rebase conflict, but it succeeded")
+	}
+
+	// 7. Verify config.ini on disk in Repo 2 has conflict markers
+	diskContent, readErr := os.ReadFile(f2)
+	if readErr != nil {
+		t.Fatalf("failed to read conflicted file: %v", readErr)
+	}
+	s := string(diskContent)
+	if !strings.Contains(s, "<<<<<<< OURS (MAIN)") || !strings.Contains(s, "=======") || !strings.Contains(s, ">>>>>>> THEIRS (SUBMITTED)") {
+		t.Fatalf("expected conflict markers in working file %s, got:\n%s", f2, s)
+	}
+	if !strings.Contains(s, "workers = 16") || !strings.Contains(s, "workers = 32") {
+		t.Fatalf("expected both versions in conflict markers, got:\n%s", s)
+	}
+}
+
+func TestSync_GitBridgePushAndPull(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed, skipping git bridge test")
+	}
+
+	// 1. Create a bare remote Git repository
+	bareDir := t.TempDir() + "/remote.git"
+	cmdInit := exec.Command("git", "init", "--bare", bareDir)
+	if out, err := cmdInit.CombinedOutput(); err != nil {
+		t.Fatalf("failed to init bare git repo: %v (%s)", err, string(out))
+	}
+
+	// 2. Create an OpenScion repo and set remote to bare git repository
+	scionDir := t.TempDir()
+	repo, err := InitLocalRepo(scionDir, "git-test-repo")
+	if err != nil {
+		t.Fatalf("failed to init local scion repo: %v", err)
+	}
+	defer repo.Close()
+
+	if err := repo.SetRemote(bareDir); err != nil {
+		t.Fatalf("failed to set remote: %v", err)
+	}
+
+	// 3. Create file in OpenScion workspace, commit, and push
+	helloFile := filepath.Join(scionDir, "hello.txt")
+	_ = os.WriteFile(helloFile, []byte("Hello from OpenScion through Git Bridge!\n"), 0644)
+
+	cs, err := repo.Commit("feat: hello world", "Scion Tester <tester@openscion.local>", "claude-3-5", "session-1", "trace-1")
+	if err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+
+	syncRes, err := repo.Push()
+	if err != nil {
+		t.Fatalf("git bridge push failed: %v", err)
+	}
+	if syncRes.PushedChangesets != 1 {
+		t.Errorf("expected 1 pushed changeset, got %d", syncRes.PushedChangesets)
+	}
+
+	// 4. Verify Git bare repo received the commit with OpenScion provenance
+	cmdLog := exec.Command("git", "--git-dir="+bareDir, "log", "-n", "1", "--pretty=full")
+	logOut, err := cmdLog.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to read git log from bare remote: %v (%s)", err, string(logOut))
+	}
+	logStr := string(logOut)
+	if !strings.Contains(logStr, "Hello from OpenScion") && !strings.Contains(logStr, "feat: hello world") {
+		t.Errorf("git log does not contain commit message: %s", logStr)
+	}
+	if !strings.Contains(logStr, "OpenScion-Seq: #"+fmt.Sprintf("%d", cs.SequenceNumber)) {
+		t.Errorf("git log missing OpenScion provenance header: %s", logStr)
+	}
+
+	// 5. Simulate an external Git user pushing a new commit into bare repo
+	extDir := t.TempDir()
+	cloneCmd := exec.Command("git", "clone", bareDir, extDir)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clone into extDir failed: %v (%s)", err, string(out))
+	}
+	extFile := filepath.Join(extDir, "ext.txt")
+	_ = os.WriteFile(extFile, []byte("external git commit\n"), 0644)
+	if out, err := exec.Command("git", "-C", extDir, "add", "ext.txt").CombinedOutput(); err != nil {
+		t.Fatalf("ext add failed: %v (%s)", err, string(out))
+	}
+	cmdExtCommit := exec.Command("git", "-C", extDir, "commit", "-m", "external commit from git")
+	cmdExtCommit.Env = append(os.Environ(), "GIT_AUTHOR_NAME=GitDev", "GIT_AUTHOR_EMAIL=gitdev@git.com", "GIT_COMMITTER_NAME=GitDev", "GIT_COMMITTER_EMAIL=gitdev@git.com")
+	if out, err := cmdExtCommit.CombinedOutput(); err != nil {
+		t.Fatalf("ext commit failed: %v (%s)", err, string(out))
+	}
+	if out, err := exec.Command("git", "-C", extDir, "push", "origin", "main").CombinedOutput(); err != nil {
+		t.Fatalf("ext push failed: %v (%s)", err, string(out))
+	}
+
+	// 6. In OpenScion, run Pull() -> should pull external git changes into workspace and DAG!
+	pullRes, err := repo.Pull()
+	if err != nil {
+		t.Fatalf("git bridge pull failed: %v", err)
+	}
+	if pullRes.PulledChangesets != 1 {
+		t.Errorf("expected 1 pulled changeset, got %d", pullRes.PulledChangesets)
+	}
+
+	// Verify ext.txt exists in OpenScion workspace
+	pulledData, err := os.ReadFile(filepath.Join(scionDir, "ext.txt"))
+	if err != nil || string(pulledData) != "external git commit\n" {
+		t.Errorf("expected ext.txt in scion workspace: %v, content: %q", err, string(pulledData))
+	}
 }
 

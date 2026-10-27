@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/aether/scn/pkg/cas"
 	"github.com/aether/scn/pkg/db"
@@ -14,7 +16,6 @@ import (
 	"github.com/aether/scn/pkg/merge"
 	"github.com/aether/scn/pkg/tree"
 	"github.com/google/uuid"
-	"syscall"
 )
 
 type Config struct {
@@ -273,6 +274,9 @@ func (r *LocalRepo) Status() ([]tree.DiffEntry, *tree.Tree, *graph.Changeset, er
 	}
 
 	diffs := tree.Diff(headTree, currentTree)
+	if len(diffs) == 0 && currentTree.RootHash == headTree.RootHash {
+		_ = r.DB.SaveTree(currentTree)
+	}
 	return diffs, currentTree, headCS, nil
 }
 
@@ -284,6 +288,10 @@ func (r *LocalRepo) Commit(message, author, agentModel, sessionID, taskTraceID s
 	}
 	defer unlock()
 
+	return r.commitUnlocked(message, author, agentModel, sessionID, taskTraceID)
+}
+
+func (r *LocalRepo) commitUnlocked(message, author, agentModel, sessionID, taskTraceID string) (*graph.Changeset, error) {
 	headCS, err := r.GetHeadChangeset()
 	if err != nil {
 		return nil, err
@@ -687,20 +695,26 @@ func (r *LocalRepo) SwitchBranch(branchName string) error {
 		return fmt.Errorf("branch %q does not exist: %w", branchName, err)
 	}
 
+	currCS, _ := r.GetHeadChangeset()
+	targetCS, err := r.DB.GetChangeset(targetBranch.HeadID)
+	if err != nil {
+		return fmt.Errorf("failed to load target branch commit: %w", err)
+	}
+
+	// Fast path: identical root tree, update branch pointer immediately with zero disk IO
+	if currCS != nil && targetCS != nil && currCS.RootTreeHash == targetCS.RootTreeHash {
+		r.Config.Branch = branchName
+		return r.SaveConfig()
+	}
+
 	diffs, _, _, err := r.Status()
 	if err == nil && len(diffs) > 0 {
 		return fmt.Errorf("cannot switch branches with uncommitted changes. Commit or discard them first.")
 	}
 
-	currCS, _ := r.GetHeadChangeset()
 	var oldTree *tree.Tree
 	if currCS != nil {
 		oldTree, _ = r.DB.GetTree(currCS.RootTreeHash)
-	}
-
-	targetCS, err := r.DB.GetChangeset(targetBranch.HeadID)
-	if err != nil {
-		return fmt.Errorf("failed to load target branch commit: %w", err)
 	}
 
 	targetTree, err := r.DB.GetTree(targetCS.RootTreeHash)
@@ -790,6 +804,83 @@ func (r *LocalRepo) RestoreAll(rev string) (int, error) {
 	}
 
 	count := r.MaterializeTreeDelta(nil, t)
+	return count, nil
+}
+
+// SetSparsePatterns updates sparse patterns and rematerializes working copy
+func (r *LocalRepo) SetSparsePatterns(patterns []string) (int, error) {
+	unlock, err := r.AcquireLock("sparse")
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+
+	r.Config.SparsePatterns = patterns
+	if err := r.SaveConfig(); err != nil {
+		return 0, err
+	}
+
+	head, err := r.GetHeadChangeset()
+	if err != nil || head == nil {
+		return 0, nil
+	}
+
+	t, err := r.DB.GetTree(head.RootTreeHash)
+	if err != nil || t == nil {
+		return 0, nil
+	}
+
+	if len(patterns) > 0 {
+		var toRemove []string
+		for relPath := range t.Entries {
+			if !tree.MatchesAnyPattern(relPath, patterns) {
+				toRemove = append(toRemove, relPath)
+			}
+		}
+
+		if len(toRemove) > 0 {
+			numWorkers := 16
+			if len(toRemove) < numWorkers {
+				numWorkers = len(toRemove)
+			}
+
+			remChan := make(chan string, len(toRemove))
+			for _, p := range toRemove {
+				remChan <- p
+			}
+			close(remChan)
+
+			var dirMap sync.Map
+			var wg sync.WaitGroup
+
+			for w := 0; w < numWorkers; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for relPath := range remChan {
+						fullPath := filepath.Join(r.WorkDir, filepath.FromSlash(relPath))
+						if err := os.Remove(fullPath); err == nil {
+							dirMap.Store(filepath.Dir(fullPath), true)
+						}
+					}
+				}()
+			}
+			wg.Wait()
+
+			dirMap.Range(func(key, value any) bool {
+				d := key.(string)
+				for cur := d; cur != r.WorkDir && cur != "." && cur != "/"; cur = filepath.Dir(cur) {
+					if err := os.Remove(cur); err != nil {
+						break
+					}
+				}
+				return true
+			})
+		}
+	}
+
+	count := r.MaterializeTreeDelta(nil, t)
+	_ = r.DB.SaveTree(t)
 	return count, nil
 }
 

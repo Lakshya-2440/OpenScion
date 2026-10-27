@@ -125,8 +125,11 @@ func ThreeWayMerge(base, ours, theirs *tree.Tree, store *cas.Store) (*Result, er
 					OursHash:   oursEntry.Hash,
 					TheirsHash: theirsEntry.Hash,
 				})
-				// Still put ours in tree as fallback
-				merged.Entries[p] = oursEntry
+				if mergedEntry != nil {
+					merged.Entries[p] = *mergedEntry
+				} else {
+					merged.Entries[p] = oursEntry
+				}
 			}
 			continue
 		}
@@ -144,16 +147,26 @@ func ThreeWayMerge(base, ours, theirs *tree.Tree, store *cas.Store) (*Result, er
 		}
 	}
 
-	// Detect structural file vs directory collisions
+	// Detect structural file vs directory collisions (O(N) directory set lookup)
+	dirs := make(map[string]bool, len(merged.Entries)*2)
 	for p := range merged.Entries {
-		prefix := p + "/"
-		for other := range merged.Entries {
-			if strings.HasPrefix(other, prefix) {
-				conflicts = append(conflicts, Conflict{
-					Path:   p,
-					Reason: fmt.Sprintf("Structural conflict: %q exists as both a file and directory (%s)", p, other),
-				})
+		parts := strings.Split(p, "/")
+		var cur string
+		for i := 0; i < len(parts)-1; i++ {
+			if cur == "" {
+				cur = parts[i]
+			} else {
+				cur = cur + "/" + parts[i]
 			}
+			dirs[cur] = true
+		}
+	}
+	for p := range merged.Entries {
+		if dirs[p] {
+			conflicts = append(conflicts, Conflict{
+				Path:   p,
+				Reason: fmt.Sprintf("Structural conflict: %q exists as both a file and directory", p),
+			})
 		}
 	}
 

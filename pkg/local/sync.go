@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/aether/scn/pkg/cas"
 	"github.com/aether/scn/pkg/client"
@@ -62,6 +65,10 @@ func (r *LocalRepo) Push() (*SyncResult, error) {
 
 	if r.Config.RemoteURL == "" {
 		return nil, fmt.Errorf("no remote server configured.\nRun: scion remote add origin <http://server-address:port>")
+	}
+
+	if IsGitRemote(r.Config.RemoteURL) {
+		return r.pushGit(r.Config.RemoteURL)
 	}
 
 	c := client.NewClient(r.Config.RemoteURL)
@@ -142,6 +149,10 @@ func (r *LocalRepo) Push() (*SyncResult, error) {
 	var lastLandedID string
 	for idx := range toPush {
 		cs := &toPush[idx]
+		originalParentID := ""
+		if len(cs.ParentIDs) > 0 {
+			originalParentID = cs.ParentIDs[0]
+		}
 		// Re-parent chained commits if previous commit in batch was speculatively rebased
 		if lastLandedID != "" && len(cs.ParentIDs) > 0 && cs.ParentIDs[0] != lastLandedID {
 			cs.ParentIDs[0] = lastLandedID
@@ -153,15 +164,14 @@ func (r *LocalRepo) Push() (*SyncResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("local tree %s is missing: %w", cs.RootTreeHash, err)
 		}
-		if err := r.validateTreeObjects(t); err != nil {
-			return nil, fmt.Errorf("cannot push changeset %s: %w", cs.ShortID(), err)
-		}
 
 		// Diff-only CAS chunk upload: compare against parent tree to avoid uploading unchanged files
 		filesToUpload := make(map[string]tree.Entry)
-		if len(cs.ParentIDs) > 0 {
-			if parentCS, err := r.DB.GetChangeset(cs.ParentIDs[0]); err == nil && parentCS != nil {
+		diffComputed := false
+		if originalParentID != "" {
+			if parentCS, err := r.DB.GetChangeset(originalParentID); err == nil && parentCS != nil {
 				if parentTree, err := r.DB.GetTree(parentCS.RootTreeHash); err == nil && parentTree != nil {
+					diffComputed = true
 					diffs := tree.Diff(parentTree, t)
 					for _, d := range diffs {
 						if d.ChangeType != tree.ChangeDeleted {
@@ -173,43 +183,93 @@ func (r *LocalRepo) Push() (*SyncResult, error) {
 				}
 			}
 		}
-		if len(filesToUpload) == 0 {
+		if !diffComputed {
 			// Fallback (root commit or parent tree unavailable): upload all tree entries
 			filesToUpload = t.Entries
 		}
 
-		var chunksToUpload []*cas.BlobChunk
-		var manifestsToUpload []*cas.BlobManifest
+		// Validate local presence only for files genuinely being uploaded in this changeset
+		// (allows sparse checkouts to push without needing 100% of monorepo blobs locally)
+		if err := r.validateObjects(filesToUpload); err != nil {
+			return nil, fmt.Errorf("cannot push changeset %s: %w", cs.ShortID(), err)
+		}
+
+		const uploadChunkBatchSize = 1024
+		const uploadChunkBatchBytes = 16 * 1024 * 1024 // 16MB max per batch
+		const uploadManifestBatchSize = 2048
+
+		var chunkBatch []*cas.BlobChunk
+		var manifestBatch []*cas.BlobManifest
+		chunkBatchBytes := 0
+		seenManifests := make(map[string]bool)
+		seenChunks := make(map[string]bool)
+
+		flushChunks := func() error {
+			if len(chunkBatch) == 0 {
+				return nil
+			}
+			if err := c.UploadChunks(chunkBatch); err != nil {
+				return fmt.Errorf("failed to upload CAS chunks: %w", err)
+			}
+			res.UploadedChunks += len(chunkBatch)
+			chunkBatch = nil
+			chunkBatchBytes = 0
+			return nil
+		}
+
+		flushManifests := func() error {
+			if len(manifestBatch) == 0 {
+				return nil
+			}
+			if err := c.UploadManifests(manifestBatch); err != nil {
+				return fmt.Errorf("failed to upload CAS manifests: %w", err)
+			}
+			manifestBatch = nil
+			return nil
+		}
+
 		for _, entry := range filesToUpload {
-			manifest, err := r.Store.GetManifest(entry.Hash)
-			if err != nil {
-				return nil, fmt.Errorf("missing manifest %s for %s: %w", entry.Hash, entry.Path, err)
-			}
-			manifestsToUpload = append(manifestsToUpload, manifest)
-			for _, cHash := range manifest.ChunkHashes {
-				chunk, err := r.Store.GetChunk(cHash)
+			if !seenManifests[entry.Hash] {
+				seenManifests[entry.Hash] = true
+				manifest, err := r.Store.GetManifest(entry.Hash)
 				if err != nil {
-					return nil, fmt.Errorf("missing chunk %s for %s: %w", cHash, entry.Path, err)
+					return nil, fmt.Errorf("missing manifest %s for %s: %w", entry.Hash, entry.Path, err)
 				}
-				if err := cas.ValidateChunk(chunk); err != nil {
-					return nil, fmt.Errorf("invalid chunk %s for %s: %w", cHash, entry.Path, err)
+				manifestBatch = append(manifestBatch, manifest)
+				if len(manifestBatch) >= uploadManifestBatchSize {
+					if err := flushManifests(); err != nil {
+						return nil, err
+					}
 				}
-				chunksToUpload = append(chunksToUpload, chunk)
-				res.UploadedBytes += int64(len(chunk.Data))
+
+				for _, cHash := range manifest.ChunkHashes {
+					if seenChunks[cHash] {
+						continue
+					}
+					seenChunks[cHash] = true
+
+					chunk, err := r.Store.GetChunk(cHash)
+					if err != nil {
+						return nil, fmt.Errorf("missing chunk %s for %s: %w", cHash, entry.Path, err)
+					}
+					chunkBatch = append(chunkBatch, chunk)
+					chunkBatchBytes += len(chunk.Data)
+					res.UploadedBytes += int64(len(chunk.Data))
+
+					if len(chunkBatch) >= uploadChunkBatchSize || chunkBatchBytes >= uploadChunkBatchBytes {
+						if err := flushChunks(); err != nil {
+							return nil, err
+						}
+					}
+				}
 			}
 		}
 
-		if len(chunksToUpload) > 0 {
-			if err := c.UploadChunks(chunksToUpload); err != nil {
-				return nil, fmt.Errorf("failed to upload CAS chunks: %w", err)
-			}
-			res.UploadedChunks += len(chunksToUpload)
+		if err := flushChunks(); err != nil {
+			return nil, err
 		}
-
-		if len(manifestsToUpload) > 0 {
-			if err := c.UploadManifests(manifestsToUpload); err != nil {
-				return nil, fmt.Errorf("failed to upload CAS manifests: %w", err)
-			}
+		if err := flushManifests(); err != nil {
+			return nil, err
 		}
 
 		// Save Merkle tree on server
@@ -225,12 +285,13 @@ func (r *LocalRepo) Push() (*SyncResult, error) {
 
 		if submitRes.Status != queue.StatusMerged {
 			if len(submitRes.Conflicts) > 0 {
+				_, _ = r.pullUnlocked()
 				var paths []string
 				for _, cf := range submitRes.Conflicts {
 					paths = append(paths, cf.Path)
 				}
-				return nil, fmt.Errorf("push rejected: rebase conflict in %d file(s): %s\nRun 'scion pull' to fetch latest changes and resolve conflicts locally",
-					len(paths), strings.Join(paths, ", "))
+				return nil, fmt.Errorf("push rejected: rebase conflict in %d file(s):\n  %s\nConflict markers (<<<<<<< HEAD) written to working files. Resolve and commit to retry",
+					len(paths), strings.Join(paths, "\n  "))
 			}
 			return nil, fmt.Errorf("push rejected: %s", submitRes.ErrorMessage)
 		}
@@ -274,6 +335,10 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 		return nil, fmt.Errorf("no remote server configured.\nRun: scion remote add origin <http://server-address:port>")
 	}
 
+	if IsGitRemote(r.Config.RemoteURL) {
+		return r.pullGit(r.Config.RemoteURL)
+	}
+
 	// Safety check: ensure local working directory has no uncommitted changes
 	diffs, _, _, err := r.Status()
 	if err != nil {
@@ -289,18 +354,27 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 		return nil, fmt.Errorf("cannot connect to remote %s: %w", r.Config.RemoteURL, err)
 	}
 
-	headCS, err := r.GetHeadChangeset()
-	if err != nil {
-		return nil, err
+	// Synchronize RepoID from remote if not yet aligned
+	if r.Config.RepoID != repoInfo.Repo.ID {
+		oldID := r.Config.RepoID
+		r.Config.RepoID = repoInfo.Repo.ID
+		_ = r.SaveConfig()
+		_ = r.DB.AlignRepoID(oldID, repoInfo.Repo.ID)
 	}
 
-	if repoInfo.SequenceNumber <= headCS.SequenceNumber && repoInfo.Branch.HeadID == headCS.ID {
+	headCS, err := r.GetHeadChangeset()
+	isFresh := headCS == nil || headCS.ID == "" || err != nil || (headCS.SequenceNumber <= 1 && len(headCS.ParentIDs) == 0 && headCS.Author == "OpenScion System <system@openscion.local>")
+
+	if !isFresh && headCS != nil && repoInfo.SequenceNumber <= headCS.SequenceNumber && repoInfo.Branch.HeadID == headCS.ID {
 		return &PullResult{
 			NewSequence: headCS.SequenceNumber,
 		}, nil
 	}
 
-	diffCount := int(repoInfo.SequenceNumber - headCS.SequenceNumber)
+	diffCount := 20
+	if headCS != nil {
+		diffCount = int(repoInfo.SequenceNumber - headCS.SequenceNumber)
+	}
 	if diffCount < 20 {
 		diffCount = 20
 	}
@@ -312,8 +386,12 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 	// Filter missing changesets
 	var missing []graph.Changeset
 	for _, cs := range remoteLog {
-		if cs.SequenceNumber > headCS.SequenceNumber || cs.ID == repoInfo.Branch.HeadID {
+		if isFresh || headCS == nil || cs.SequenceNumber > headCS.SequenceNumber {
 			missing = append(missing, cs)
+		} else if cs.ID == repoInfo.Branch.HeadID {
+			if existing, err := r.DB.GetChangeset(cs.ID); err != nil || existing == nil {
+				missing = append(missing, cs)
+			}
 		}
 	}
 
@@ -337,9 +415,36 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 		}
 		latestTree = remoteTree
 
-		// 1. Collect missing manifest hashes
+		// Collect entries to sync (only diff entries if parent tree is already known)
+		entriesToSync := remoteTree.Entries
+		if len(cs.ParentIDs) > 0 {
+			if parentCS, err := r.DB.GetChangeset(cs.ParentIDs[0]); err == nil && parentCS != nil {
+				if parentTree, err := r.DB.GetTree(parentCS.RootTreeHash); err == nil && parentTree != nil {
+					deltaEntries := make(map[string]tree.Entry)
+					diffs := tree.Diff(parentTree, remoteTree)
+					for _, d := range diffs {
+						if d.ChangeType != tree.ChangeDeleted {
+							if entry, ok := remoteTree.Entries[d.Path]; ok {
+								deltaEntries[d.Path] = entry
+							}
+						}
+					}
+					entriesToSync = deltaEntries
+				}
+			}
+		}
+
+		// 1. Collect missing manifest hashes (respecting sparse filters if configured)
 		var missingManifestHashes []string
-		for _, entry := range remoteTree.Entries {
+		seenManifests := make(map[string]bool)
+		for path, entry := range entriesToSync {
+			if len(r.Config.SparsePatterns) > 0 && !tree.MatchesAnyPattern(path, r.Config.SparsePatterns) {
+				continue
+			}
+			if seenManifests[entry.Hash] {
+				continue
+			}
+			seenManifests[entry.Hash] = true
 			if _, err := r.Store.GetManifest(entry.Hash); err != nil {
 				missingManifestHashes = append(missingManifestHashes, entry.Hash)
 			}
@@ -357,14 +462,22 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 			}
 		}
 
-		// 2. Collect missing chunk hashes
+		// 2. Collect missing chunk hashes (respecting sparse filters if configured)
 		var missingChunkHashes []string
-		for _, entry := range remoteTree.Entries {
+		seenChunks := make(map[string]bool)
+		for path, entry := range entriesToSync {
+			if len(r.Config.SparsePatterns) > 0 && !tree.MatchesAnyPattern(path, r.Config.SparsePatterns) {
+				continue
+			}
 			manifest, err := r.Store.GetManifest(entry.Hash)
 			if err != nil {
 				return nil, fmt.Errorf("downloaded manifest %s is unavailable: %w", entry.Hash, err)
 			}
 			for _, cHash := range manifest.ChunkHashes {
+				if seenChunks[cHash] {
+					continue
+				}
+				seenChunks[cHash] = true
 				if _, err := r.Store.GetChunk(cHash); err != nil {
 					missingChunkHashes = append(missingChunkHashes, cHash)
 				}
@@ -384,7 +497,35 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 				res.DownloadedBytes += int64(len(chunk.Data))
 			}
 		}
-		if err := r.validateTreeObjects(remoteTree); err != nil {
+
+		// Verify downloaded content (only for new/modified entries if parent tree is known)
+		entriesToVerify := remoteTree.Entries
+		if len(cs.ParentIDs) > 0 {
+			if parentCS, err := r.DB.GetChangeset(cs.ParentIDs[0]); err == nil && parentCS != nil {
+				if parentTree, err := r.DB.GetTree(parentCS.RootTreeHash); err == nil && parentTree != nil {
+					deltaEntries := make(map[string]tree.Entry)
+					diffs := tree.Diff(parentTree, remoteTree)
+					for _, d := range diffs {
+						if d.ChangeType != tree.ChangeDeleted {
+							if entry, ok := remoteTree.Entries[d.Path]; ok {
+								deltaEntries[d.Path] = entry
+							}
+						}
+					}
+					entriesToVerify = deltaEntries
+				}
+			}
+		}
+		if len(r.Config.SparsePatterns) > 0 {
+			filtered := make(map[string]tree.Entry)
+			for p, entry := range entriesToVerify {
+				if tree.MatchesAnyPattern(p, r.Config.SparsePatterns) {
+					filtered[p] = entry
+				}
+			}
+			entriesToVerify = filtered
+		}
+		if err := r.validateObjects(entriesToVerify); err != nil {
 			return nil, fmt.Errorf("remote changeset %s has incomplete content: %w", cs.ShortID(), err)
 		}
 
@@ -402,7 +543,7 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 
 		// Check if local headCS is an ancestor of newestCS (fast-forward path)
 		isAncestor := false
-		if headCS.ID == "" {
+		if isFresh || headCS == nil || headCS.ID == "" {
 			isAncestor = true
 		} else {
 			visitedA := make(map[string]bool)
@@ -428,14 +569,12 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 			if err := r.DB.UpdateBranchTip(r.Config.RepoID, r.Config.Branch, newestCS.ID, newestCS.SequenceNumber); err != nil {
 				return nil, fmt.Errorf("failed to update local branch: %w", err)
 			}
-			oldTree, _ := r.DB.GetTree(headCS.RootTreeHash)
-			res.UpdatedFiles = r.MaterializeTreeDelta(oldTree, latestTree)
-			if remaining, _, _, statusErr := r.Status(); statusErr != nil || len(remaining) > 0 {
-				if statusErr != nil {
-					return nil, fmt.Errorf("failed to verify materialized pull: %w", statusErr)
-				}
-				return nil, fmt.Errorf("pull completed but working tree is not synchronized (%d differences)", len(remaining))
+			var oldTree *tree.Tree
+			if !isFresh && headCS != nil {
+				oldTree, _ = r.DB.GetTree(headCS.RootTreeHash)
 			}
+			res.UpdatedFiles = r.MaterializeTreeDelta(oldTree, latestTree)
+			_ = r.DB.SaveTree(latestTree)
 		} else {
 			// Local commits diverged! Find common ancestor and 3-way speculative rebase
 			localAncestors := make(map[string]bool)
@@ -509,11 +648,13 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 			}
 
 			if !mRes.Clean {
+				r.MaterializeTreeDelta(headTree, mRes.MergedTree)
 				var paths []string
 				for _, cf := range mRes.Conflicts {
 					paths = append(paths, cf.Path)
 				}
-				return nil, fmt.Errorf("pull conflict between unpushed local commits and remote in %d file(s): %s\nResolve conflicts or push your branch before pulling", len(paths), strings.Join(paths, ", "))
+				return nil, fmt.Errorf("automatic merge conflict in %d file(s):\n  %s\nConflict markers (<<<<<<< HEAD) written to working files. Resolve conflicts and commit result",
+					len(paths), strings.Join(paths, "\n  "))
 			}
 
 			if err := r.DB.SaveTree(mRes.MergedTree); err != nil {
@@ -539,12 +680,7 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 				return nil, err
 			}
 			res.UpdatedFiles = r.MaterializeTreeDelta(headTree, mRes.MergedTree)
-			if remaining, _, _, statusErr := r.Status(); statusErr != nil || len(remaining) > 0 {
-				if statusErr != nil {
-					return nil, fmt.Errorf("failed to verify materialized merge: %w", statusErr)
-				}
-				return nil, fmt.Errorf("pull merge completed but working tree is not synchronized (%d differences)", len(remaining))
-			}
+			_ = r.DB.SaveTree(mRes.MergedTree)
 			res.NewSequence = rebasedCS.SequenceNumber
 		}
 	}
@@ -552,27 +688,83 @@ func (r *LocalRepo) pullUnlocked() (*PullResult, error) {
 	return res, nil
 }
 
+func (r *LocalRepo) validateObjects(entries map[string]tree.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	type entryTask struct {
+		path  string
+		entry tree.Entry
+	}
+
+	taskList := make([]entryTask, 0, len(entries))
+	for path, entry := range entries {
+		taskList = append(taskList, entryTask{path: path, entry: entry})
+	}
+
+	numWorkers := runtime.NumCPU() * 2
+	if numWorkers < 8 {
+		numWorkers = 8
+	}
+	if numWorkers > 32 {
+		numWorkers = 32
+	}
+	if numWorkers > len(taskList) {
+		numWorkers = len(taskList)
+	}
+
+	taskCh := make(chan entryTask, len(taskList))
+	for _, t := range taskList {
+		taskCh <- t
+	}
+	close(taskCh)
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskCh {
+				if firstErr != nil {
+					return
+				}
+				manifest, err := r.Store.GetManifest(task.entry.Hash)
+				if err != nil {
+					errOnce.Do(func() { firstErr = fmt.Errorf("missing manifest for %s: %w", task.path, err) })
+					return
+				}
+				if err := cas.ValidateManifest(manifest); err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				for _, cHash := range manifest.ChunkHashes {
+					chunk, err := r.Store.GetChunk(cHash)
+					if err != nil {
+						errOnce.Do(func() { firstErr = fmt.Errorf("missing chunk %s for %s: %w", cHash, task.path, err) })
+						return
+					}
+					if err := cas.ValidateChunk(chunk); err != nil {
+						errOnce.Do(func() { firstErr = fmt.Errorf("invalid chunk %s for %s: %w", cHash, task.path, err) })
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
+}
+
 func (r *LocalRepo) validateTreeObjects(t *tree.Tree) error {
 	if err := t.Validate(); err != nil {
 		return err
 	}
-	for path, entry := range t.Entries {
-		manifest, err := r.Store.GetManifest(entry.Hash)
-		if err != nil {
-			return fmt.Errorf("missing manifest for %s: %w", path, err)
-		}
-		if err := cas.ValidateManifest(manifest); err != nil {
-			return err
-		}
-		data, err := r.Store.GetBlob(manifest)
-		if err != nil {
-			return fmt.Errorf("cannot read %s: %w", path, err)
-		}
-		if int64(len(data)) != entry.Size || cas.HashBytes(data) != entry.Hash {
-			return fmt.Errorf("content integrity check failed for %s", path)
-		}
-	}
-	return nil
+	return r.validateObjects(t.Entries)
 }
 
 func (r *LocalRepo) downloadTreeObjects(c *client.Client, t *tree.Tree) error {
@@ -580,7 +772,15 @@ func (r *LocalRepo) downloadTreeObjects(c *client.Client, t *tree.Tree) error {
 		return err
 	}
 	manifestHashes := make([]string, 0)
-	for _, entry := range t.Entries {
+	seenManifests := make(map[string]bool)
+	for path, entry := range t.Entries {
+		if len(r.Config.SparsePatterns) > 0 && !tree.MatchesAnyPattern(path, r.Config.SparsePatterns) {
+			continue
+		}
+		if seenManifests[entry.Hash] {
+			continue
+		}
+		seenManifests[entry.Hash] = true
 		if _, err := r.Store.GetManifest(entry.Hash); err != nil {
 			manifestHashes = append(manifestHashes, entry.Hash)
 		}
@@ -597,12 +797,20 @@ func (r *LocalRepo) downloadTreeObjects(c *client.Client, t *tree.Tree) error {
 		}
 	}
 	chunkHashes := make([]string, 0)
-	for _, entry := range t.Entries {
+	seenChunks := make(map[string]bool)
+	for path, entry := range t.Entries {
+		if len(r.Config.SparsePatterns) > 0 && !tree.MatchesAnyPattern(path, r.Config.SparsePatterns) {
+			continue
+		}
 		manifest, err := r.Store.GetManifest(entry.Hash)
 		if err != nil {
 			return err
 		}
 		for _, hash := range manifest.ChunkHashes {
+			if seenChunks[hash] {
+				continue
+			}
+			seenChunks[hash] = true
 			if _, err := r.Store.GetChunk(hash); err != nil {
 				chunkHashes = append(chunkHashes, hash)
 			}
@@ -619,7 +827,17 @@ func (r *LocalRepo) downloadTreeObjects(c *client.Client, t *tree.Tree) error {
 			}
 		}
 	}
-	return r.validateTreeObjects(t)
+	entriesToVerify := t.Entries
+	if len(r.Config.SparsePatterns) > 0 {
+		filtered := make(map[string]tree.Entry)
+		for p, entry := range t.Entries {
+			if tree.MatchesAnyPattern(p, r.Config.SparsePatterns) {
+				filtered[p] = entry
+			}
+		}
+		entriesToVerify = filtered
+	}
+	return r.validateObjects(entriesToVerify)
 }
 
 // MaterializeTree extracts files from the Merkle tree to the local working directory
@@ -632,58 +850,170 @@ func (r *LocalRepo) MaterializeTreeDelta(oldTree, newTree *tree.Tree) int {
 	if newTree == nil {
 		return 0
 	}
+	// Identical trees: instant zero-IO return
+	if oldTree != nil && oldTree.RootHash == newTree.RootHash {
+		return 0
+	}
 	count := 0
 
-	// 1. Delete files present in oldTree but absent in newTree
+	// Delta path: compute Myers diff between oldTree and newTree and only touch changed files
 	if oldTree != nil {
-		for oldPath := range oldTree.Entries {
-			if _, exists := newTree.Entries[oldPath]; !exists {
-				fullPath := filepath.Join(r.WorkDir, filepath.FromSlash(oldPath))
+		// Align newTree.Entries' ModTimes with local machine for unchanged files
+		for p, newEntry := range newTree.Entries {
+			if oldEntry, ok := oldTree.Entries[p]; ok && oldEntry.Hash == newEntry.Hash {
+				newEntry.ModTime = oldEntry.ModTime
+				newTree.Entries[p] = newEntry
+			}
+		}
+
+		diffs := tree.Diff(oldTree, newTree)
+		for _, d := range diffs {
+			if len(r.Config.SparsePatterns) > 0 && !tree.MatchesAnyPattern(d.Path, r.Config.SparsePatterns) {
+				continue
+			}
+			fullPath := filepath.Join(r.WorkDir, filepath.FromSlash(d.Path))
+			if d.ChangeType == tree.ChangeDeleted {
 				_ = os.Remove(fullPath)
-				// Clean up empty directories upwards
 				dir := filepath.Dir(fullPath)
 				for dir != r.WorkDir && dir != "." && dir != "/" {
 					if err := os.Remove(dir); err != nil {
-						break // Not empty or permission issue
+						break
 					}
 					dir = filepath.Dir(dir)
 				}
+			} else {
+				entry, ok := newTree.Entries[d.Path]
+				if !ok {
+					continue
+				}
+				data, err := r.Store.GetBlobByHash(entry.Hash)
+				if err != nil {
+					continue
+				}
+				if fi, err := os.Lstat(fullPath); err == nil && fi.IsDir() {
+					_ = os.RemoveAll(fullPath)
+				}
+				for dDir := filepath.Dir(fullPath); dDir != r.WorkDir && dDir != "." && dDir != "/"; dDir = filepath.Dir(dDir) {
+					if fi, err := os.Lstat(dDir); err == nil && !fi.IsDir() {
+						_ = os.Remove(dDir)
+					}
+				}
+				_ = os.MkdirAll(filepath.Dir(fullPath), 0755)
+				if entry.Mode == 0120000 {
+					_ = os.Remove(fullPath)
+					if err := os.Symlink(string(data), fullPath); err == nil {
+						count++
+						if fi, statErr := os.Lstat(fullPath); statErr == nil {
+							entry.ModTime = fi.ModTime().UnixNano()
+							newTree.Entries[d.Path] = entry
+						}
+					}
+				} else {
+					_ = os.Remove(fullPath)
+					if err := os.WriteFile(fullPath, data, os.FileMode(entry.Mode)); err == nil {
+						count++
+						if fi, statErr := os.Lstat(fullPath); statErr == nil {
+							entry.ModTime = fi.ModTime().UnixNano()
+							newTree.Entries[d.Path] = entry
+						}
+					}
+				}
 			}
 		}
+		return count
 	}
 
-	// 2. Materialize added or modified files
+	// Full tree materialization fallback (oldTree == nil, e.g. fresh clone or restore-all)
+	type matTask struct {
+		relPath string
+		entry   tree.Entry
+	}
+	var tasks []matTask
+	dirsToCreate := make(map[string]bool)
+
 	for relPath, entry := range newTree.Entries {
-		data, err := r.Store.GetBlobByHash(entry.Hash)
-		if err != nil {
+		if len(r.Config.SparsePatterns) > 0 && !tree.MatchesAnyPattern(relPath, r.Config.SparsePatterns) {
 			continue
 		}
+		tasks = append(tasks, matTask{relPath: relPath, entry: entry})
 		fullPath := filepath.Join(r.WorkDir, filepath.FromSlash(relPath))
-
-		// If fullPath is currently a directory, remove it so file can be written
-		if fi, err := os.Lstat(fullPath); err == nil && fi.IsDir() {
-			_ = os.RemoveAll(fullPath)
-		}
-		// If any ancestor directory of fullPath is currently a regular file, remove that file
-		for d := filepath.Dir(fullPath); d != r.WorkDir && d != "." && d != "/"; d = filepath.Dir(d) {
-			if fi, err := os.Lstat(d); err == nil && !fi.IsDir() {
-				_ = os.Remove(d)
-			}
-		}
-
-		_ = os.MkdirAll(filepath.Dir(fullPath), 0755)
-
-		if entry.Mode == 0120000 {
-			_ = os.Remove(fullPath)
-			if err := os.Symlink(string(data), fullPath); err == nil {
-				count++
-			}
-		} else {
-			_ = os.Remove(fullPath)
-			if err := os.WriteFile(fullPath, data, os.FileMode(entry.Mode)); err == nil {
-				count++
-			}
-		}
+		dirsToCreate[filepath.Dir(fullPath)] = true
 	}
-	return count
+
+	if len(tasks) == 0 {
+		return 0
+	}
+
+	// Pre-create all unique directories once
+	for dir := range dirsToCreate {
+		_ = os.MkdirAll(dir, 0755)
+	}
+
+	numWorkers := 16
+	if len(tasks) < numWorkers {
+		numWorkers = len(tasks)
+	}
+
+	taskChan := make(chan matTask, len(tasks))
+	for _, tsk := range tasks {
+		taskChan <- tsk
+	}
+	close(taskChan)
+
+	var wg sync.WaitGroup
+	var countAtomic int64
+	var entriesMu sync.Mutex
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var updatedLocal []struct {
+				relPath string
+				modTime int64
+			}
+			for tsk := range taskChan {
+				data, err := r.Store.GetBlobByHash(tsk.entry.Hash)
+				if err != nil {
+					continue
+				}
+				fullPath := filepath.Join(r.WorkDir, filepath.FromSlash(tsk.relPath))
+				if tsk.entry.Mode == 0120000 {
+					_ = os.Remove(fullPath)
+					if err := os.Symlink(string(data), fullPath); err == nil {
+						atomic.AddInt64(&countAtomic, 1)
+						if fi, statErr := os.Lstat(fullPath); statErr == nil {
+							updatedLocal = append(updatedLocal, struct {
+								relPath string
+								modTime int64
+							}{relPath: tsk.relPath, modTime: fi.ModTime().UnixNano()})
+						}
+					}
+				} else {
+					if err := os.WriteFile(fullPath, data, os.FileMode(tsk.entry.Mode)); err == nil {
+						atomic.AddInt64(&countAtomic, 1)
+						if fi, statErr := os.Lstat(fullPath); statErr == nil {
+							updatedLocal = append(updatedLocal, struct {
+								relPath string
+								modTime int64
+							}{relPath: tsk.relPath, modTime: fi.ModTime().UnixNano()})
+						}
+					}
+				}
+			}
+
+			if len(updatedLocal) > 0 {
+				entriesMu.Lock()
+				for _, ul := range updatedLocal {
+					e := newTree.Entries[ul.relPath]
+					e.ModTime = ul.modTime
+					newTree.Entries[ul.relPath] = e
+				}
+				entriesMu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return int(countAtomic)
 }

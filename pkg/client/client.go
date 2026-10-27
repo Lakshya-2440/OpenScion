@@ -2,14 +2,17 @@ package client
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aether/scn/pkg/cas"
@@ -48,9 +51,23 @@ func NewClient(serverURL string) *Client {
 		token = os.Getenv("AETHER_AUTH_TOKEN")
 	}
 
+	baseTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   200,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	transport := &authTransport{
 		token: token,
-		base:  http.DefaultTransport,
+		base:  baseTransport,
 	}
 
 	return &Client{
@@ -58,7 +75,7 @@ func NewClient(serverURL string) *Client {
 		transport: transport,
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   30 * time.Second,
+			Timeout:   120 * time.Second,
 		},
 	}
 }
@@ -146,9 +163,10 @@ func (c *Client) UploadChunks(chunks []*cas.BlobChunk) error {
 		return nil
 	}
 
-	const maxBatchBytes = 8 * 1024 * 1024 // 8MB per HTTP request
-	const maxBatchCount = 64
+	const maxBatchBytes = 16 * 1024 * 1024 // 16MB per HTTP request
+	const maxBatchCount = 1024
 
+	var batches [][]chunkWire
 	for i := 0; i < len(chunks); {
 		var batch []chunkWire
 		batchBytes := 0
@@ -162,26 +180,77 @@ func (c *Client) UploadChunks(chunks []*cas.BlobChunk) error {
 			batchBytes += len(chunks[i].Data)
 			i++
 		}
-
-		body, err := json.Marshal(batch)
-		if err != nil {
-			return err
-		}
-
-		resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/blobs/batch-put", "application/json", bytes.NewReader(body))
-		if err != nil {
-			return err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			errResp, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return fmt.Errorf("upload chunks failed (%d): %s", resp.StatusCode, string(errResp))
-		}
-		resp.Body.Close()
+		batches = append(batches, batch)
 	}
 
-	return nil
+	if len(batches) <= 1 {
+		for _, b := range batches {
+			body, err := json.Marshal(b)
+			if err != nil {
+				return err
+			}
+			resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/blobs/batch-put", "application/json", bytes.NewReader(body))
+			if err != nil {
+				return err
+			}
+			if resp.StatusCode != http.StatusOK {
+				errResp, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				return fmt.Errorf("upload chunks failed (%d): %s", resp.StatusCode, string(errResp))
+			}
+			resp.Body.Close()
+		}
+		return nil
+	}
+
+	numWorkers := 16
+	if len(batches) < numWorkers {
+		numWorkers = len(batches)
+	}
+
+	batchChan := make(chan []chunkWire, len(batches))
+	for _, b := range batches {
+		batchChan <- b
+	}
+	close(batchChan)
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range batchChan {
+				if firstErr != nil {
+					return
+				}
+				body, err := json.Marshal(batch)
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/blobs/batch-put", "application/json", bytes.NewReader(body))
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				if resp.StatusCode != http.StatusOK {
+					errResp, _ := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("upload chunks failed (%d): %s", resp.StatusCode, string(errResp))
+					})
+					return
+				}
+				resp.Body.Close()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
 }
 
 func (c *Client) DownloadChunks(hashes []string) ([]*cas.BlobChunk, error) {
@@ -189,69 +258,124 @@ func (c *Client) DownloadChunks(hashes []string) ([]*cas.BlobChunk, error) {
 		return nil, nil
 	}
 
-	const batchSize = 64
-	var allChunks []*cas.BlobChunk
+	unique := make([]string, 0, len(hashes))
+	seen := make(map[string]bool, len(hashes))
+	for _, h := range hashes {
+		if !seen[h] {
+			seen[h] = true
+			unique = append(unique, h)
+		}
+	}
+	hashes = unique
 
+	const batchSize = 1024
+	var batches [][]string
 	for i := 0; i < len(hashes); i += batchSize {
 		end := i + batchSize
 		if end > len(hashes) {
 			end = len(hashes)
 		}
-		batch := hashes[i:end]
-
-		reqBody, _ := json.Marshal(map[string][]string{"hashes": batch})
-		resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/blobs/batch-get", "application/json", bytes.NewReader(reqBody))
-		if err != nil {
-			return nil, err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			errResp, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return nil, fmt.Errorf("download chunks failed (%d): %s", resp.StatusCode, string(errResp))
-		}
-
-		var wireList []chunkWire
-		decodeErr := json.NewDecoder(resp.Body).Decode(&wireList)
-		resp.Body.Close()
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-		expected := make(map[string]bool, len(batch))
-		for _, hash := range batch {
-			expected[hash] = true
-		}
-		for _, wire := range wireList {
-			if !expected[wire.Hash] {
-				return nil, fmt.Errorf("server returned unexpected chunk %s", wire.Hash)
-			}
-			raw, err := base64.StdEncoding.DecodeString(wire.DataBase64)
-			if err != nil {
-				return nil, fmt.Errorf("invalid chunk %s from server: %w", wire.Hash, err)
-			}
-			if err := cas.ValidateChunk(&cas.BlobChunk{Hash: wire.Hash, UncompressedSz: wire.UncompressedSz, Data: raw}); err != nil {
-				return nil, fmt.Errorf("invalid chunk %s from server: %w", wire.Hash, err)
-			}
-			delete(expected, wire.Hash)
-		}
-		if len(expected) != 0 {
-			return nil, fmt.Errorf("server omitted %d requested chunks", len(expected))
-		}
-
-		for _, w := range wireList {
-			raw, err := base64.StdEncoding.DecodeString(w.DataBase64)
-			if err != nil {
-				continue
-			}
-			allChunks = append(allChunks, &cas.BlobChunk{
-				Hash:           w.Hash,
-				UncompressedSz: w.UncompressedSz,
-				Data:           raw,
-			})
-		}
+		batches = append(batches, hashes[i:end])
 	}
 
+	if len(batches) <= 1 {
+		return c.downloadChunkBatch(hashes)
+	}
+
+	numWorkers := 16
+	if len(batches) < numWorkers {
+		numWorkers = len(batches)
+	}
+
+	type batchTask struct {
+		index  int
+		hashes []string
+	}
+
+	taskChan := make(chan batchTask, len(batches))
+	for i, b := range batches {
+		taskChan <- batchTask{index: i, hashes: b}
+	}
+	close(taskChan)
+
+	results := make([][]*cas.BlobChunk, len(batches))
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskChan {
+				if firstErr != nil {
+					return
+				}
+				chunks, err := c.downloadChunkBatch(task.hashes)
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				results[task.index] = chunks
+			}
+		}()
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	var allChunks []*cas.BlobChunk
+	for _, res := range results {
+		allChunks = append(allChunks, res...)
+	}
 	return allChunks, nil
+}
+
+func (c *Client) downloadChunkBatch(batch []string) ([]*cas.BlobChunk, error) {
+	reqBody, _ := json.Marshal(map[string][]string{"hashes": batch})
+	resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/blobs/batch-get", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		errResp, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("download chunks failed (%d): %s", resp.StatusCode, string(errResp))
+	}
+
+	var wireList []chunkWire
+	decodeErr := json.NewDecoder(resp.Body).Decode(&wireList)
+	resp.Body.Close()
+	if decodeErr != nil {
+		return nil, decodeErr
+	}
+	expected := make(map[string]bool, len(batch))
+	for _, hash := range batch {
+		expected[hash] = true
+	}
+	var out []*cas.BlobChunk
+	for _, wire := range wireList {
+		if !expected[wire.Hash] {
+			return nil, fmt.Errorf("server returned unexpected chunk %s", wire.Hash)
+		}
+		raw, err := base64.StdEncoding.DecodeString(wire.DataBase64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid chunk %s from server: %w", wire.Hash, err)
+		}
+		chunk := &cas.BlobChunk{Hash: wire.Hash, UncompressedSz: wire.UncompressedSz, Data: raw}
+		if err := cas.ValidateChunk(chunk); err != nil {
+			return nil, fmt.Errorf("invalid chunk %s from server: %w", wire.Hash, err)
+		}
+		delete(expected, wire.Hash)
+		out = append(out, chunk)
+	}
+	if len(expected) != 0 {
+		return nil, fmt.Errorf("server omitted %d requested chunks", len(expected))
+	}
+	return out, nil
 }
 
 func (c *Client) UploadManifests(manifests []*cas.BlobManifest) error {
@@ -259,33 +383,82 @@ func (c *Client) UploadManifests(manifests []*cas.BlobManifest) error {
 		return nil
 	}
 
-	const batchSize = 128
+	const batchSize = 2048
+	var batches [][]*cas.BlobManifest
 	for i := 0; i < len(manifests); i += batchSize {
 		end := i + batchSize
 		if end > len(manifests) {
 			end = len(manifests)
 		}
-		batch := manifests[i:end]
+		batches = append(batches, manifests[i:end])
+	}
 
-		body, err := json.Marshal(batch)
+	if len(batches) <= 1 {
+		body, err := json.Marshal(manifests)
 		if err != nil {
 			return err
 		}
-
 		resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/manifests/batch-put", "application/json", bytes.NewReader(body))
 		if err != nil {
 			return err
 		}
-
 		if resp.StatusCode != http.StatusOK {
 			errResp, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			return fmt.Errorf("upload manifests failed (%d): %s", resp.StatusCode, string(errResp))
 		}
 		resp.Body.Close()
+		return nil
 	}
 
-	return nil
+	numWorkers := 16
+	if len(batches) < numWorkers {
+		numWorkers = len(batches)
+	}
+
+	batchChan := make(chan []*cas.BlobManifest, len(batches))
+	for _, b := range batches {
+		batchChan <- b
+	}
+	close(batchChan)
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range batchChan {
+				if firstErr != nil {
+					return
+				}
+				body, err := json.Marshal(batch)
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/manifests/batch-put", "application/json", bytes.NewReader(body))
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				if resp.StatusCode != http.StatusOK {
+					errResp, _ := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("upload manifests failed (%d): %s", resp.StatusCode, string(errResp))
+					})
+					return
+				}
+				resp.Body.Close()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
 }
 
 func (c *Client) DownloadManifests(hashes []string) ([]*cas.BlobManifest, error) {
@@ -293,55 +466,116 @@ func (c *Client) DownloadManifests(hashes []string) ([]*cas.BlobManifest, error)
 		return nil, nil
 	}
 
-	const batchSize = 128
-	var allManifests []*cas.BlobManifest
+	unique := make([]string, 0, len(hashes))
+	seen := make(map[string]bool, len(hashes))
+	for _, h := range hashes {
+		if !seen[h] {
+			seen[h] = true
+			unique = append(unique, h)
+		}
+	}
+	hashes = unique
 
+	const batchSize = 2048
+	var batches [][]string
 	for i := 0; i < len(hashes); i += batchSize {
 		end := i + batchSize
 		if end > len(hashes) {
 			end = len(hashes)
 		}
-		batch := hashes[i:end]
-
-		reqBody, _ := json.Marshal(map[string][]string{"hashes": batch})
-		resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/manifests/batch-get", "application/json", bytes.NewReader(reqBody))
-		if err != nil {
-			return nil, err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			errResp, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return nil, fmt.Errorf("download manifests failed (%d): %s", resp.StatusCode, string(errResp))
-		}
-
-		var manifests []*cas.BlobManifest
-		decodeErr := json.NewDecoder(resp.Body).Decode(&manifests)
-		resp.Body.Close()
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-		expected := make(map[string]bool, len(batch))
-		for _, hash := range batch {
-			expected[hash] = true
-		}
-		for _, manifest := range manifests {
-			if manifest == nil || !expected[manifest.BlobHash] {
-				return nil, fmt.Errorf("server returned unexpected manifest")
-			}
-			if err := cas.ValidateManifest(manifest); err != nil {
-				return nil, fmt.Errorf("invalid manifest %s from server: %w", manifest.BlobHash, err)
-			}
-			delete(expected, manifest.BlobHash)
-		}
-		if len(expected) != 0 {
-			return nil, fmt.Errorf("server omitted %d requested manifests", len(expected))
-		}
-
-		allManifests = append(allManifests, manifests...)
+		batches = append(batches, hashes[i:end])
 	}
 
+	if len(batches) <= 1 {
+		return c.downloadManifestBatch(hashes)
+	}
+
+	numWorkers := 16
+	if len(batches) < numWorkers {
+		numWorkers = len(batches)
+	}
+
+	type batchTask struct {
+		index  int
+		hashes []string
+	}
+
+	taskChan := make(chan batchTask, len(batches))
+	for i, b := range batches {
+		taskChan <- batchTask{index: i, hashes: b}
+	}
+	close(taskChan)
+
+	results := make([][]*cas.BlobManifest, len(batches))
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskChan {
+				if firstErr != nil {
+					return
+				}
+				manifests, err := c.downloadManifestBatch(task.hashes)
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				results[task.index] = manifests
+			}
+		}()
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	var allManifests []*cas.BlobManifest
+	for _, res := range results {
+		allManifests = append(allManifests, res...)
+	}
 	return allManifests, nil
+}
+
+func (c *Client) downloadManifestBatch(batch []string) ([]*cas.BlobManifest, error) {
+	reqBody, _ := json.Marshal(map[string][]string{"hashes": batch})
+	resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/manifests/batch-get", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		errResp, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("download manifests failed (%d): %s", resp.StatusCode, string(errResp))
+	}
+
+	var manifests []*cas.BlobManifest
+	if err := json.NewDecoder(resp.Body).Decode(&manifests); err != nil {
+		return nil, err
+	}
+	expected := make(map[string]bool, len(batch))
+	for _, hash := range batch {
+		expected[hash] = true
+	}
+	for _, manifest := range manifests {
+		if manifest == nil || !expected[manifest.BlobHash] {
+			return nil, fmt.Errorf("server returned unexpected manifest")
+		}
+		if err := cas.ValidateManifest(manifest); err != nil {
+			return nil, fmt.Errorf("invalid manifest %s from server: %w", manifest.BlobHash, err)
+		}
+		delete(expected, manifest.BlobHash)
+	}
+	if len(expected) != 0 {
+		return nil, fmt.Errorf("server omitted %d requested manifests", len(expected))
+	}
+
+	return manifests, nil
 }
 
 func (c *Client) SaveTree(t *tree.Tree) error {
@@ -350,7 +584,27 @@ func (c *Client) SaveTree(t *tree.Tree) error {
 		return err
 	}
 
-	resp, err := c.httpClient.Post(c.baseURL+"/api/v1/cas/trees/put", "application/json", bytes.NewReader(body))
+	var reqBody io.Reader = bytes.NewReader(body)
+	var contentEncoding string
+	if len(body) > 1024 {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(body); err == nil && zw.Close() == nil {
+			reqBody = &buf
+			contentEncoding = "gzip"
+		}
+	}
+
+	req, err := http.NewRequest("POST", c.baseURL+"/api/v1/cas/trees/put", reqBody)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if contentEncoding != "" {
+		req.Header.Set("Content-Encoding", contentEncoding)
+	}
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}

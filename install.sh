@@ -190,8 +190,13 @@ if [ "$INSTALLED" -eq 0 ]; then
     else
       ln -sf "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/$ALIAS_NAME"
     fi
+    if [ -d "$TEMP_DIR/src/cmd/aether-server" ]; then
+      run_with_progress "$SCOPE_LABEL (building aether-server)" bash -c "cd \"\$1\" && go build -ldflags='-s -w' -o \"\$2\" ./cmd/aether-server" _ "$TEMP_DIR/src" "$TEMP_DIR/aether-server"
+      cp "$TEMP_DIR/aether-server" "$INSTALL_DIR/aether-server"
+      chmod +x "$INSTALL_DIR/aether-server"
+    fi
     INSTALLED=1
-    echo -e "${GREEN}✓ Successfully compiled and installed OpenScion.${RESET}"
+    echo -e "${GREEN}✓ Successfully compiled and installed OpenScion (scion, scn, aether-server).${RESET}"
   else
     echo -e "${RED}Error: Neither prebuilt binary nor Go compiler found.${RESET}"
     echo -e "Please install Go (https://go.dev) or download release from https://github.com/${REPO}/releases"
@@ -202,6 +207,7 @@ fi
 # Ad-hoc codesign on macOS to prevent SIGKILL 137
 if [ "$PLATFORM" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
   run_with_progress "$SCOPE_LABEL (signing binary)" codesign -s - -f "$INSTALL_DIR/$BINARY_NAME" || true
+  [ -f "$INSTALL_DIR/aether-server" ] && codesign -s - -f "$INSTALL_DIR/aether-server" >/dev/null 2>&1 || true
 fi
 
 # 5. Check PATH and configure shell profile if needed

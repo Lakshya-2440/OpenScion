@@ -9,6 +9,7 @@ import (
 	"github.com/aether/scn/pkg/db"
 	"github.com/aether/scn/pkg/graph"
 	"github.com/aether/scn/pkg/merge"
+	"github.com/aether/scn/pkg/tree"
 	"github.com/google/uuid"
 )
 
@@ -30,9 +31,9 @@ type SubmitResult struct {
 }
 
 type MergeQueue struct {
-	db    *db.DB
-	store *cas.Store
-	mu    sync.Mutex // In-process serialization + atomic DB CAS for distributed coordination
+	db        *db.DB
+	store     *cas.Store
+	repoLocks sync.Map // repoID (string) -> *sync.Mutex
 }
 
 func NewMergeQueue(database *db.DB, store *cas.Store) *MergeQueue {
@@ -40,6 +41,11 @@ func NewMergeQueue(database *db.DB, store *cas.Store) *MergeQueue {
 		db:    database,
 		store: store,
 	}
+}
+
+func (q *MergeQueue) getRepoLock(repoID string) *sync.Mutex {
+	val, _ := q.repoLocks.LoadOrStore(repoID, &sync.Mutex{})
+	return val.(*sync.Mutex)
 }
 
 // Submit processes a changeset submission through speculative rebase and distributed atomic CAS landing
@@ -55,13 +61,81 @@ func (q *MergeQueue) Submit(repoID string, cs *graph.Changeset) (*SubmitResult, 
 	if err := treeValue.Validate(); err != nil {
 		return nil, fmt.Errorf("submitted tree failed validation: %w", err)
 	}
-	for path, entry := range treeValue.Entries {
-		if _, err := q.store.GetBlobByHash(entry.Hash); err != nil {
-			return nil, fmt.Errorf("submitted content for %s is unavailable: %w", path, err)
+
+	// Verify submitted CAS content (diff-only against parent or main tip to avoid multi-GB re-reads on large monorepos)
+	entriesToVerify := treeValue.Entries
+	if len(cs.ParentIDs) > 0 && cs.ParentIDs[0] != "" {
+		if parentCS, err := q.db.GetChangeset(cs.ParentIDs[0]); err == nil && parentCS != nil {
+			if parentTree, err := q.db.GetTree(parentCS.RootTreeHash); err == nil && parentTree != nil {
+				diffEntries := make(map[string]tree.Entry)
+				for p, entry := range treeValue.Entries {
+					if parentEntry, exists := parentTree.Entries[p]; !exists || parentEntry.Hash != entry.Hash {
+						diffEntries[p] = entry
+					}
+				}
+				entriesToVerify = diffEntries
+			}
 		}
 	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	// Fallback to diffing against tip of main if parent commit was speculatively rebased by server
+	if len(entriesToVerify) == len(treeValue.Entries) {
+		if mainBranch, err := q.db.GetBranch(repoID, "main"); err == nil && mainBranch != nil {
+			if tipCS, err := q.db.GetChangeset(mainBranch.HeadID); err == nil && tipCS != nil {
+				if tipTree, err := q.db.GetTree(tipCS.RootTreeHash); err == nil && tipTree != nil {
+					diffEntries := make(map[string]tree.Entry)
+					for p, entry := range treeValue.Entries {
+						if tipEntry, exists := tipTree.Entries[p]; !exists || tipEntry.Hash != entry.Hash {
+							diffEntries[p] = entry
+						}
+					}
+					entriesToVerify = diffEntries
+				}
+			}
+		}
+	}
+
+	// Verify submitted CAS content concurrently via fast HasManifest check
+	if len(entriesToVerify) > 0 {
+		var missingErr error
+		var once sync.Once
+		workChan := make(chan tree.Entry, len(entriesToVerify))
+		for _, entry := range entriesToVerify {
+			workChan <- entry
+		}
+		close(workChan)
+
+		numWorkers := 16
+		if len(entriesToVerify) < numWorkers {
+			numWorkers = len(entriesToVerify)
+		}
+
+		var wg sync.WaitGroup
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for entry := range workChan {
+					if missingErr != nil {
+						return
+					}
+					if !q.store.HasManifest(entry.Hash) {
+						once.Do(func() {
+							missingErr = fmt.Errorf("submitted content for %s is unavailable", entry.Path)
+						})
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		if missingErr != nil {
+			return nil, missingErr
+		}
+	}
+
+	repoLock := q.getRepoLock(repoID)
+	repoLock.Lock()
+	defer repoLock.Unlock()
 
 	cs.RepoID = repoID
 	cs.ID = cs.ComputeID()

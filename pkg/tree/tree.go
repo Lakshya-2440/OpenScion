@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/aether/scn/pkg/cas"
 )
@@ -252,6 +254,69 @@ func BuildTreeFromDirWithBase(rootPath string, store *cas.Store, ignorePatterns 
 	return BuildTreeFromDirWithBaseAndSparse(rootPath, store, ignorePatterns, baseTree, nil)
 }
 
+type pendingFileTask struct {
+	path          string
+	normalizedRel string
+	fileSize      int64
+	mode          uint32
+	modTime       int64
+	isSymlink     bool
+	linkTarget    string
+}
+
+type dirQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	dirs   []string
+	active int
+	closed bool
+}
+
+func newDirQueue(initialDir string) *dirQueue {
+	q := &dirQueue{
+		dirs:   []string{initialDir},
+		active: 0,
+	}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *dirQueue) push(d string) {
+	q.mu.Lock()
+	q.dirs = append(q.dirs, d)
+	q.cond.Signal()
+	q.mu.Unlock()
+}
+
+func (q *dirQueue) pop() (string, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for len(q.dirs) == 0 {
+		if q.active == 0 || q.closed {
+			q.closed = true
+			q.cond.Broadcast()
+			return "", false
+		}
+		q.cond.Wait()
+	}
+
+	d := q.dirs[len(q.dirs)-1]
+	q.dirs = q.dirs[:len(q.dirs)-1]
+	q.active++
+	return d, true
+}
+
+func (q *dirQueue) done() {
+	q.mu.Lock()
+	q.active--
+	if q.active == 0 && len(q.dirs) == 0 {
+		q.closed = true
+		q.cond.Broadcast()
+	}
+	q.mu.Unlock()
+}
+
 // BuildTreeFromDirWithBaseAndSparse scans working dir, preserving entries outside sparse patterns from baseTree
 func BuildTreeFromDirWithBaseAndSparse(rootPath string, store *cas.Store, ignorePatterns []string, baseTree *Tree, sparsePatterns []string) (*Tree, error) {
 	t := NewTree()
@@ -259,137 +324,230 @@ func BuildTreeFromDirWithBaseAndSparse(rootPath string, store *cas.Store, ignore
 		ignorePatterns = LoadIgnorePatterns(rootPath)
 	}
 
-	caseMap := make(map[string]string)
+	numDirWorkers := runtime.NumCPU() * 2
+	if numDirWorkers < 8 {
+		numDirWorkers = 8
+	}
+	if numDirWorkers > 32 {
+		numDirWorkers = 32
+	}
 
-	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
+	dq := newDirQueue(rootPath)
+	cachedCh := make(chan Entry, 8192)
+	taskCh := make(chan pendingFileTask, 8192)
 
-		if info != nil && info.IsDir() {
-			name := info.Name()
-			if name == "mnt" || name == ".scion" || name == ".scn" || name == ".git" || name == "node_modules" || name == ".vercel" {
-				return filepath.SkipDir
-			}
-		}
+	var dirWg sync.WaitGroup
+	for w := 0; w < numDirWorkers; w++ {
+		dirWg.Add(1)
+		go func() {
+			defer dirWg.Done()
+			for {
+				dir, ok := dq.pop()
+				if !ok {
+					return
+				}
 
-		relPath, err := filepath.Rel(rootPath, path)
-		if err != nil {
-			return nil
-		}
-		if relPath == "." {
-			return nil
-		}
+				entries, readErr := os.ReadDir(dir)
+				if readErr == nil {
+					for _, d := range entries {
+						name := d.Name()
+						fullPath := filepath.Join(dir, name)
 
-		normalizedRel := filepath.ToSlash(relPath)
-		if MatchesAnyPattern(normalizedRel, ignorePatterns) || MatchesAnyPattern(info.Name(), ignorePatterns) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if info.IsDir() {
-			return nil
-		}
-
-		// Detect case-folding collisions on case-insensitive filesystems (macOS APFS / Windows NTFS)
-		lower := strings.ToLower(normalizedRel)
-		if existing, collided := caseMap[lower]; collided && existing != normalizedRel {
-			return fmt.Errorf("case collision detected: %q and %q collide on case-insensitive filesystems", existing, normalizedRel)
-		}
-		caseMap[lower] = normalizedRel
-
-		fileMode := info.Mode()
-		// Safely skip sockets, FIFOs (named pipes), and devices that would hang os.ReadFile or error
-		if fileMode&(os.ModeSocket|os.ModeNamedPipe|os.ModeDevice|os.ModeCharDevice) != 0 {
-			return nil
-		}
-
-		isSymlink := fileMode&os.ModeSymlink != 0
-		var linkTarget string
-		if isSymlink {
-			target, err := os.Readlink(path)
-			if err != nil {
-				return nil // Broken or inaccessible symlink: skip without aborting scan
-			}
-			linkTarget = target
-		} else if !fileMode.IsRegular() {
-			return nil
-		}
-
-		var mode uint32 = 0644
-		if fileMode&0111 != 0 {
-			mode = 0755
-		}
-		if isSymlink {
-			mode = 0120000
-		}
-		modTime := info.ModTime().UnixNano()
-
-		fileSize := info.Size()
-		if isSymlink {
-			fileSize = int64(len(linkTarget))
-		}
-
-		// Cache check: reuse entry if baseTree entry matches size, mode, and modtime
-		if baseTree != nil {
-			if oldEntry, ok := baseTree.Entries[normalizedRel]; ok {
-				if oldEntry.Size == fileSize && oldEntry.Mode == mode {
-					if oldEntry.ModTime == 0 || oldEntry.ModTime == modTime {
-						t.Entries[normalizedRel] = Entry{
-							Path:    normalizedRel,
-							Type:    TypeBlob,
-							Hash:    oldEntry.Hash,
-							Size:    oldEntry.Size,
-							Mode:    mode,
-							ModTime: modTime,
+						if d.IsDir() {
+							if name == "mnt" || name == ".scion" || name == ".scn" || name == ".git" || name == "node_modules" || name == ".vercel" {
+								continue
+							}
+							rel, relErr := filepath.Rel(rootPath, fullPath)
+							if relErr != nil {
+								continue
+							}
+							normRel := filepath.ToSlash(rel)
+							if MatchesAnyPattern(normRel, ignorePatterns) || MatchesAnyPattern(name, ignorePatterns) {
+								continue
+							}
+							dq.push(fullPath)
+							continue
 						}
-						return nil
+
+						rel, relErr := filepath.Rel(rootPath, fullPath)
+						if relErr != nil || rel == "." {
+							continue
+						}
+						normalizedRel := filepath.ToSlash(rel)
+						if MatchesAnyPattern(normalizedRel, ignorePatterns) || MatchesAnyPattern(name, ignorePatterns) {
+							continue
+						}
+
+						info, infoErr := d.Info()
+						if infoErr != nil {
+							continue
+						}
+
+						fileMode := info.Mode()
+						if fileMode&(os.ModeSocket|os.ModeNamedPipe|os.ModeDevice|os.ModeCharDevice) != 0 {
+							continue
+						}
+
+						isSymlink := fileMode&os.ModeSymlink != 0
+						var linkTarget string
+						if isSymlink {
+							target, err := os.Readlink(fullPath)
+							if err != nil {
+								continue
+							}
+							linkTarget = target
+						} else if !fileMode.IsRegular() {
+							continue
+						}
+
+						var mode uint32 = 0644
+						if fileMode&0111 != 0 {
+							mode = 0755
+						}
+						if isSymlink {
+							mode = 0120000
+						}
+						modTime := info.ModTime().UnixNano()
+						fileSize := info.Size()
+						if isSymlink {
+							fileSize = int64(len(linkTarget))
+						}
+
+						// Cache check: reuse entry if baseTree entry matches size, mode, and modtime
+						if baseTree != nil {
+							if oldEntry, ok := baseTree.Entries[normalizedRel]; ok {
+								if oldEntry.Size == fileSize && oldEntry.Mode == mode {
+									if oldEntry.ModTime == 0 || oldEntry.ModTime == modTime {
+										cachedCh <- Entry{
+											Path:    normalizedRel,
+											Type:    TypeBlob,
+											Hash:    oldEntry.Hash,
+											Size:    oldEntry.Size,
+											Mode:    mode,
+											ModTime: modTime,
+										}
+										continue
+									}
+								}
+							}
+						}
+
+						taskCh <- pendingFileTask{
+							path:          fullPath,
+							normalizedRel: normalizedRel,
+							fileSize:      fileSize,
+							mode:          mode,
+							modTime:       modTime,
+							isSymlink:     isSymlink,
+							linkTarget:    linkTarget,
+						}
 					}
 				}
+				dq.done()
 			}
-		}
+		}()
+	}
 
-		var manifest *cas.BlobManifest
-		if isSymlink {
-			m, err := store.PutBlob([]byte(linkTarget))
-			if err != nil {
-				return nil
-			}
-			manifest = m
-		} else if fileSize > cas.ChunkSize {
-			// Stream large files directly in chunks to prevent heap spikes / OOM
-			m, err := store.PutBlobFromFile(path)
-			if err != nil {
-				return nil
-			}
-			manifest = m
-		} else {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return nil
-			}
-			m, err := store.PutBlob(data)
-			if err != nil {
-				return nil
-			}
-			manifest = m
-		}
+	go func() {
+		dirWg.Wait()
+		close(cachedCh)
+		close(taskCh)
+	}()
 
-		t.Entries[normalizedRel] = Entry{
-			Path:    normalizedRel,
-			Type:    TypeBlob,
-			Hash:    manifest.BlobHash,
-			Size:    fileSize,
-			Mode:    mode,
-			ModTime: modTime,
-		}
-		return nil
-	})
+	numHashWorkers := runtime.NumCPU() * 2
+	if numHashWorkers < 8 {
+		numHashWorkers = 8
+	}
+	if numHashWorkers > 32 {
+		numHashWorkers = 32
+	}
 
-	if err != nil {
+	resCh := make(chan Entry, 8192)
+	errCh := make(chan error, numHashWorkers)
+	var hashWg sync.WaitGroup
+
+	for w := 0; w < numHashWorkers; w++ {
+		hashWg.Add(1)
+		go func() {
+			defer hashWg.Done()
+			for task := range taskCh {
+				var manifest *cas.BlobManifest
+				var procErr error
+				if task.isSymlink {
+					manifest, procErr = store.PutBlob([]byte(task.linkTarget))
+				} else if task.fileSize > cas.ChunkSize {
+					manifest, procErr = store.PutBlobFromFile(task.path)
+				} else {
+					data, readErr := os.ReadFile(task.path)
+					if readErr != nil {
+						procErr = readErr
+					} else {
+						manifest, procErr = store.PutBlob(data)
+					}
+				}
+				if procErr != nil {
+					select {
+					case errCh <- procErr:
+					default:
+					}
+					return
+				}
+				resCh <- Entry{
+					Path:    task.normalizedRel,
+					Type:    TypeBlob,
+					Hash:    manifest.BlobHash,
+					Size:    task.fileSize,
+					Mode:    task.mode,
+					ModTime: task.modTime,
+				}
+			}
+		}()
+	}
+
+	go func() {
+		hashWg.Wait()
+		close(resCh)
+	}()
+
+	// Concurrent collectors to prevent channel backpressure deadlocks
+	var collectWg sync.WaitGroup
+	var entriesMu sync.Mutex
+	collectWg.Add(2)
+
+	go func() {
+		defer collectWg.Done()
+		for entry := range cachedCh {
+			entriesMu.Lock()
+			t.Entries[entry.Path] = entry
+			entriesMu.Unlock()
+		}
+	}()
+
+	go func() {
+		defer collectWg.Done()
+		for entry := range resCh {
+			entriesMu.Lock()
+			t.Entries[entry.Path] = entry
+			entriesMu.Unlock()
+		}
+	}()
+
+	collectWg.Wait()
+
+	select {
+	case err := <-errCh:
 		return nil, err
+	default:
+	}
+
+	// Detect case-folding collisions on case-insensitive filesystems (macOS APFS / Windows NTFS)
+	caseMap := make(map[string]string, len(t.Entries))
+	for p := range t.Entries {
+		lower := strings.ToLower(p)
+		if existing, collided := caseMap[lower]; collided && existing != p {
+			return nil, fmt.Errorf("case collision detected: %q and %q collide on case-insensitive filesystems", existing, p)
+		}
+		caseMap[lower] = p
 	}
 
 	// Preserve entries outside sparse pattern from baseTree to prevent wiping unmanaged monorepo directories

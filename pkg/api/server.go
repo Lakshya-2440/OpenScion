@@ -1,6 +1,7 @@
 package api
 
 import (
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/aether/scn/pkg/cas"
 	"github.com/aether/scn/pkg/db"
@@ -103,9 +106,21 @@ func (s *Server) registerRoutes() {
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
+	writeJSONWithReq(w, nil, status, data)
+}
+
+func writeJSONWithReq(w http.ResponseWriter, r *http.Request, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
+	if r != nil && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(status)
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		_ = json.NewEncoder(gz).Encode(data)
+		return
+	}
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
@@ -183,30 +198,65 @@ func (s *Server) handleBatchPutBlobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	saved := 0
-	for _, cw := range chunks {
-		raw, err := base64.StdEncoding.DecodeString(cw.DataBase64)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid base64 chunk payload")
-			return
-		}
-		c := &cas.BlobChunk{
-			Hash:           cw.Hash,
-			UncompressedSz: cw.UncompressedSz,
-			Data:           raw,
-		}
-		if err := cas.ValidateChunk(c); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := s.store.PutChunk(c); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		saved++
+	if len(chunks) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"saved_chunks": 0})
+		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"saved_chunks": saved})
+	numWorkers := 16
+	if len(chunks) < numWorkers {
+		numWorkers = len(chunks)
+	}
+
+	taskChan := make(chan ChunkWire, len(chunks))
+	for _, cw := range chunks {
+		taskChan <- cw
+	}
+	close(taskChan)
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	var savedCount int64
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for cw := range taskChan {
+				if firstErr != nil {
+					return
+				}
+				if s.store.HasChunk(cw.Hash) {
+					atomic.AddInt64(&savedCount, 1)
+					continue
+				}
+				raw, err := base64.StdEncoding.DecodeString(cw.DataBase64)
+				if err != nil {
+					errOnce.Do(func() { firstErr = fmt.Errorf("invalid base64 chunk payload: %w", err) })
+					return
+				}
+				c := &cas.BlobChunk{
+					Hash:           cw.Hash,
+					UncompressedSz: cw.UncompressedSz,
+					Data:           raw,
+				}
+				if err := s.store.PutChunk(c); err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				atomic.AddInt64(&savedCount, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		writeError(w, http.StatusInternalServerError, firstErr.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"saved_chunks": savedCount})
 }
 
 func (s *Server) handleBatchGetBlobs(w http.ResponseWriter, r *http.Request) {
@@ -242,24 +292,59 @@ func (s *Server) handleBatchPutManifests(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	saved := 0
-	for _, m := range manifests {
-		if m == nil {
-			writeError(w, http.StatusBadRequest, "nil manifest")
-			return
-		}
-		if err := cas.ValidateManifest(m); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := s.store.SaveManifest(m); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		saved++
+	if len(manifests) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"saved_manifests": 0})
+		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"saved_manifests": saved})
+	numWorkers := 16
+	if len(manifests) < numWorkers {
+		numWorkers = len(manifests)
+	}
+
+	taskChan := make(chan *cas.BlobManifest, len(manifests))
+	for _, m := range manifests {
+		taskChan <- m
+	}
+	close(taskChan)
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	var savedCount int64
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for m := range taskChan {
+				if firstErr != nil {
+					return
+				}
+				if m == nil {
+					errOnce.Do(func() { firstErr = fmt.Errorf("nil manifest") })
+					return
+				}
+				if s.store.HasManifest(m.BlobHash) {
+					atomic.AddInt64(&savedCount, 1)
+					continue
+				}
+				if err := s.store.SaveManifest(m); err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				atomic.AddInt64(&savedCount, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		writeError(w, http.StatusInternalServerError, firstErr.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"saved_manifests": savedCount})
 }
 
 func (s *Server) handleBatchGetManifests(w http.ResponseWriter, r *http.Request) {
@@ -285,8 +370,19 @@ func (s *Server) handleBatchGetManifests(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handlePutTree(w http.ResponseWriter, r *http.Request) {
+	body := r.Body
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid gzip tree payload: "+err.Error())
+			return
+		}
+		defer gz.Close()
+		body = gz
+	}
+
 	var t tree.Tree
-	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
+	if err := json.NewDecoder(body).Decode(&t); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid tree JSON: "+err.Error())
 		return
 	}
@@ -307,7 +403,7 @@ func (s *Server) handlePutTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"root_hash": t.RootHash})
+	writeJSONWithReq(w, r, http.StatusOK, map[string]string{"root_hash": t.RootHash})
 }
 
 func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
@@ -317,7 +413,7 @@ func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "tree not found: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, t)
+	writeJSONWithReq(w, r, http.StatusOK, t)
 }
 
 func (s *Server) handleGetSparseTree(w http.ResponseWriter, r *http.Request) {
@@ -330,12 +426,13 @@ func (s *Server) handleGetSparseTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var patterns []string
 	if patternsRaw != "" {
-		patterns := strings.Split(patternsRaw, ",")
-		t = t.FilterSparse(patterns)
+		patterns = strings.Split(patternsRaw, ",")
 	}
 
-	writeJSON(w, http.StatusOK, t)
+	sparse := t.FilterSparse(patterns)
+	writeJSONWithReq(w, r, http.StatusOK, sparse)
 }
 
 func (s *Server) handleSubmitChangeset(w http.ResponseWriter, r *http.Request) {

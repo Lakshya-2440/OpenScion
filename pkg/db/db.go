@@ -211,6 +211,16 @@ func (d *DB) initSchema() error {
 			enqueued_at INTEGER NOT NULL,
 			landed_at INTEGER
 		);`,
+		`CREATE TABLE IF NOT EXISTS stashes (
+			id TEXT PRIMARY KEY,
+			repo_id TEXT NOT NULL,
+			branch TEXT NOT NULL,
+			base_changeset_id TEXT NOT NULL,
+			tree_hash TEXT NOT NULL,
+			message TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_stashes_repo_created ON stashes(repo_id, created_at DESC);`,
 	}
 
 	for _, q := range queries {
@@ -222,6 +232,27 @@ func (d *DB) initSchema() error {
 		}
 	}
 	return nil
+}
+
+// AlignRepoID synchronizes local repo_id across repositories, branches, and changesets
+func (d *DB) AlignRepoID(oldID, newID string) error {
+	if oldID == newID || oldID == "" || newID == "" {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.sqlDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, _ = d.execTx(tx, `UPDATE repositories SET id = ? WHERE id = ?`, newID, oldID)
+	_, _ = d.execTx(tx, `UPDATE branches SET repo_id = ? WHERE repo_id = ?`, newID, oldID)
+	_, _ = d.execTx(tx, `UPDATE changesets SET repo_id = ? WHERE repo_id = ?`, newID, oldID)
+
+	return tx.Commit()
 }
 
 // CreateRepo creates a new repository and initial empty main branch
@@ -367,9 +398,18 @@ func (d *DB) DeleteBranch(repoID, branchName string) error {
 
 func (d *DB) UpdateBranchTip(repoID, branchName, newHeadID string, newSeq int64) error {
 	now := time.Now().Unix()
-	_, err := d.exec(`UPDATE branches SET head_changeset_id = ?, sequence_number = ?, updated_at = ?
+	res, err := d.exec(`UPDATE branches SET head_changeset_id = ?, sequence_number = ?, updated_at = ?
 		WHERE repo_id = ? AND name = ?`, newHeadID, newSeq, now, repoID, branchName)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		_, err = d.exec(`INSERT INTO branches (repo_id, name, head_changeset_id, sequence_number, updated_at)
+			VALUES (?, ?, ?, ?, ?)`, repoID, branchName, newHeadID, newSeq, now)
+		return err
+	}
+	return nil
 }
 
 // CompareAndSwapBranchTip atomically updates a branch tip only if current head and sequence match expected
@@ -598,4 +638,54 @@ func (d *DB) GetMergeQueueEntry(id string) (*MergeQueueEntry, error) {
 		e.LandedAt = landedAt.Int64
 	}
 	return &e, nil
+}
+
+type Stash struct {
+	ID              string `json:"id"`
+	RepoID          string `json:"repo_id"`
+	Branch          string `json:"branch"`
+	BaseChangesetID string `json:"base_changeset_id"`
+	TreeHash        string `json:"tree_hash"`
+	Message         string `json:"message"`
+	CreatedAt       int64  `json:"created_at"`
+}
+
+func (d *DB) SaveStash(s *Stash) error {
+	_, err := d.exec(`INSERT INTO stashes (id, repo_id, branch, base_changeset_id, tree_hash, message, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, s.ID, s.RepoID, s.Branch, s.BaseChangesetID, s.TreeHash, s.Message, s.CreatedAt)
+	return err
+}
+
+func (d *DB) ListStashes(repoID string) ([]*Stash, error) {
+	rows, err := d.query(`SELECT id, repo_id, branch, base_changeset_id, tree_hash, message, created_at
+		FROM stashes WHERE repo_id = ? ORDER BY created_at DESC`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stashes []*Stash
+	for rows.Next() {
+		var s Stash
+		if err := rows.Scan(&s.ID, &s.RepoID, &s.Branch, &s.BaseChangesetID, &s.TreeHash, &s.Message, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		stashes = append(stashes, &s)
+	}
+	return stashes, nil
+}
+
+func (d *DB) GetStash(id string) (*Stash, error) {
+	row := d.queryRow(`SELECT id, repo_id, branch, base_changeset_id, tree_hash, message, created_at
+		FROM stashes WHERE id = ?`, id)
+	var s Stash
+	if err := row.Scan(&s.ID, &s.RepoID, &s.Branch, &s.BaseChangesetID, &s.TreeHash, &s.Message, &s.CreatedAt); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (d *DB) DeleteStash(id string) error {
+	_, err := d.exec(`DELETE FROM stashes WHERE id = ?`, id)
+	return err
 }

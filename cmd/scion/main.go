@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,7 +43,7 @@ func main() {
 		cmdDiff(args)
 	case "commit":
 		cmdCommit(args)
-	case "checkout":
+	case "checkout", "switch", "restore":
 		cmdCheckout(args)
 	case "branch":
 		cmdBranch(args)
@@ -67,6 +69,10 @@ func main() {
 		cmdServe(args)
 	case "gc":
 		cmdGC(args)
+	case "stash":
+		cmdStash(args)
+	case "sparse":
+		cmdSparse(args)
 	case "bench":
 		cmdBench(args)
 	case "help", "--help", "-h":
@@ -93,6 +99,8 @@ func printUsage() {
 	fmt.Println("  show [commit-id|#seq]         Display commit details and tree structure")
 	fmt.Println("  clone <source> [dir]          Fast sparse clone from local path or remote repository")
 	fmt.Println("  mount [dir] [--rev #seq]      Mount virtual filesystem (instant 0-byte ghost tree, lazy fetch)")
+	fmt.Println("  stash [push|pop|list|show|drop] Stash dirty working state into CAS stack")
+	fmt.Println("  sparse [list|set|add|clear]   Manage sparse checkout patterns and materialization")
 	fmt.Println("  bench                         Run reproducible performance benchmarks")
 	fmt.Println()
 	fmt.Println("Remote & Team Collaboration:")
@@ -109,13 +117,71 @@ func printUsage() {
 	fmt.Println()
 }
 
+// parseFlagsFlexible parses flags regardless of whether they appear before, after, or among positional arguments.
+// Returns the positional arguments in order.
+func parseFlagsFlexible(fs *flag.FlagSet, args []string) []string {
+	var flagArgs []string
+	var posArgs []string
+	stopParsingFlags := false
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if stopParsingFlags {
+			posArgs = append(posArgs, arg)
+			continue
+		}
+
+		if arg == "--" {
+			stopParsingFlags = true
+			continue
+		}
+
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flagStr := strings.TrimLeft(arg, "-")
+			eqIdx := strings.Index(flagStr, "=")
+			flagName := flagStr
+			if eqIdx != -1 {
+				flagName = flagStr[:eqIdx]
+			}
+
+			f := fs.Lookup(flagName)
+			if f != nil {
+				type boolFlag interface {
+					IsBoolFlag() bool
+				}
+				isBool := false
+				if bf, ok := f.Value.(boolFlag); ok && bf.IsBoolFlag() {
+					isBool = true
+				}
+
+				if eqIdx != -1 || isBool {
+					flagArgs = append(flagArgs, arg)
+				} else {
+					flagArgs = append(flagArgs, arg)
+					if i+1 < len(args) {
+						flagArgs = append(flagArgs, args[i+1])
+						i++
+					}
+				}
+			} else {
+				flagArgs = append(flagArgs, arg)
+			}
+		} else {
+			posArgs = append(posArgs, arg)
+		}
+	}
+
+	_ = fs.Parse(flagArgs)
+	return posArgs
+}
+
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	fs.Parse(args)
+	posArgs := parseFlagsFlexible(fs, args)
 
 	repoName := "project"
-	if len(fs.Args()) > 0 {
-		repoName = fs.Args()[0]
+	if len(posArgs) > 0 {
+		repoName = posArgs[0]
 	} else {
 		wd, err := os.Getwd()
 		if err == nil {
@@ -143,7 +209,7 @@ func cmdInit(args []string) {
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	verboseFlag := fs.Bool("v", false, "Show all files without truncation")
-	fs.Parse(args)
+	parseFlagsFlexible(fs, args)
 
 	repo, err := local.OpenLocalRepo(".")
 	if err != nil {
@@ -221,7 +287,7 @@ func cmdDiff(args []string) {
 	fs := flag.NewFlagSet("diff", flag.ExitOnError)
 	statOnly := fs.Bool("s", false, "Show diffstat only")
 	showAll := fs.Bool("a", false, "Show full diff without truncation")
-	fs.Parse(args)
+	posArgs := parseFlagsFlexible(fs, args)
 
 	repo, err := local.OpenLocalRepo(".")
 	if err != nil {
@@ -237,8 +303,8 @@ func cmdDiff(args []string) {
 	}
 
 	targetPath := ""
-	if len(fs.Args()) > 0 {
-		targetPath = fs.Args()[0]
+	if len(posArgs) > 0 {
+		targetPath = posArgs[0]
 	}
 
 	if len(diffs) == 0 {
@@ -390,8 +456,9 @@ func cmdCommit(args []string) {
 	fs := flag.NewFlagSet("commit", flag.ExitOnError)
 	msgFlag := fs.String("m", "", "Commit message (required)")
 	agentFlag := fs.String("agent", "", "Override agent model")
+	sessionFlag := fs.String("session", "", "Agent session ID")
 	traceFlag := fs.String("trace", "", "Prompt trace or task ID")
-	fs.Parse(args)
+	parseFlagsFlexible(fs, args)
 
 	if *msgFlag == "" {
 		ui.PrintError("Commit message is required: scion commit -m \"<message>\"")
@@ -408,7 +475,7 @@ func cmdCommit(args []string) {
 	diffs, _, _, _ := repo.Status()
 	fileCount := len(diffs)
 
-	cs, err := repo.Commit(*msgFlag, "", *agentFlag, "", *traceFlag)
+	cs, err := repo.Commit(*msgFlag, "", *agentFlag, *sessionFlag, *traceFlag)
 	if err != nil {
 		ui.PrintError(err.Error())
 		os.Exit(1)
@@ -429,7 +496,7 @@ func cmdBranch(args []string) {
 	fs := flag.NewFlagSet("branch", flag.ExitOnError)
 	deleteFlag := fs.String("d", "", "Delete branch")
 	fs.StringVar(deleteFlag, "delete", "", "Delete branch")
-	fs.Parse(args)
+	posArgs := parseFlagsFlexible(fs, args)
 
 	repo, err := local.OpenLocalRepo(".")
 	if err != nil {
@@ -447,7 +514,7 @@ func cmdBranch(args []string) {
 		return
 	}
 
-	if len(fs.Args()) == 0 {
+	if len(posArgs) == 0 {
 		branches, err := repo.ListBranches()
 		if err != nil {
 			ui.PrintError(fmt.Sprintf("Failed to list branches: %v", err))
@@ -465,7 +532,7 @@ func cmdBranch(args []string) {
 		return
 	}
 
-	newBranch := fs.Args()[0]
+	newBranch := posArgs[0]
 	if err := repo.CreateBranch(newBranch); err != nil {
 		ui.PrintError(fmt.Sprintf("Failed to create branch: %v", err))
 		os.Exit(1)
@@ -477,7 +544,7 @@ func cmdCheckout(args []string) {
 	fs := flag.NewFlagSet("checkout", flag.ExitOnError)
 	revFlag := fs.String("rev", "", "Commit sequence number (#seq) or ID to restore from")
 	branchFlag := fs.Bool("b", false, "Create and switch to a new branch")
-	fs.Parse(args)
+	posArgs := parseFlagsFlexible(fs, args)
 
 	repo, err := local.OpenLocalRepo(".")
 	if err != nil {
@@ -486,7 +553,7 @@ func cmdCheckout(args []string) {
 	}
 	defer repo.Close()
 
-	if len(fs.Args()) == 0 {
+	if len(posArgs) == 0 {
 		if *revFlag != "" {
 			count, err := repo.RestoreAll(*revFlag)
 			if err != nil {
@@ -500,7 +567,7 @@ func cmdCheckout(args []string) {
 		os.Exit(1)
 	}
 
-	target := fs.Args()[0]
+	target := posArgs[0]
 
 	// 1. If -b flag is set, create and switch
 	if *branchFlag {
@@ -554,6 +621,10 @@ func cmdCheckout(args []string) {
 }
 
 func cmdLog(args []string) {
+	fs := flag.NewFlagSet("log", flag.ExitOnError)
+	limitFlag := fs.Int("n", 50, "Limit number of commits displayed")
+	parseFlagsFlexible(fs, args)
+
 	repo, err := local.OpenLocalRepo(".")
 	if err != nil {
 		ui.PrintError(err.Error())
@@ -561,7 +632,7 @@ func cmdLog(args []string) {
 	}
 	defer repo.Close()
 
-	changesets, err := repo.Log(50)
+	changesets, err := repo.Log(*limitFlag)
 	if err != nil {
 		ui.PrintError(fmt.Sprintf("Failed to query log: %v", err))
 		os.Exit(1)
@@ -631,6 +702,10 @@ func cmdBlame(args []string) {
 }
 
 func cmdShow(args []string) {
+	fs := flag.NewFlagSet("show", flag.ExitOnError)
+	allFlag := fs.Bool("all", false, "Show all files without truncation")
+	posArgs := parseFlagsFlexible(fs, args)
+
 	repo, err := local.OpenLocalRepo(".")
 	if err != nil {
 		ui.PrintError(err.Error())
@@ -639,8 +714,10 @@ func cmdShow(args []string) {
 	defer repo.Close()
 
 	var cs *graph.Changeset
-	if len(args) > 0 {
-		cs, err = repo.ResolveChangeset(args[0])
+	refArg := ""
+	if len(posArgs) > 0 {
+		refArg = posArgs[0]
+		cs, err = repo.ResolveChangeset(refArg)
 	} else {
 		cs, err = repo.GetHeadChangeset()
 	}
@@ -663,8 +740,28 @@ func cmdShow(args []string) {
 	t, err := repo.DB.GetTree(cs.RootTreeHash)
 	if err == nil {
 		fmt.Printf("%sFiles in Tree (%d):%s\n", ui.Bold, len(t.Entries), ui.Reset)
-		for p, e := range t.Entries {
-			fmt.Printf("  • %-35s %s%s%s\n", p, ui.Dim, e.Hash[:10], ui.Reset)
+		sortedPaths := make([]string, 0, len(t.Entries))
+		for p := range t.Entries {
+			sortedPaths = append(sortedPaths, p)
+		}
+		sort.Strings(sortedPaths)
+
+		limit := len(sortedPaths)
+		truncated := false
+		if !*allFlag && limit > 30 {
+			limit = 30
+			truncated = true
+		}
+
+		for i := 0; i < limit; i++ {
+			p := sortedPaths[i]
+			e := t.Entries[p]
+			fmt.Printf("  • %-35s %s%s%s\n", p, ui.Dim, e.Hash[:min(10, len(e.Hash))], ui.Reset)
+		}
+
+		if truncated {
+			fmt.Printf("\n  %s... and %d more files (run 'scion show --all %s' to view all)%s\n",
+				ui.BrightCyan, len(sortedPaths)-30, refArg, ui.Reset)
 		}
 		fmt.Println()
 	}
@@ -673,22 +770,134 @@ func cmdShow(args []string) {
 func cmdClone(args []string) {
 	fs := flag.NewFlagSet("clone", flag.ExitOnError)
 	sparseFlag := fs.String("sparse", "", "Comma-separated sparse path patterns (e.g. 'src/**,config/*')")
-	fs.Parse(args)
+	posArgs := parseFlagsFlexible(fs, args)
 
-	if len(fs.Args()) < 1 {
-		ui.PrintError("Usage: scion clone <source-dir> [target-dir] [--sparse <patterns>]")
+	if len(posArgs) < 1 {
+		ui.PrintError("Usage: scion clone <source-dir|git-url> [target-dir] [--sparse <patterns>]")
 		os.Exit(1)
 	}
 
-	source := fs.Args()[0]
+	source := posArgs[0]
 	target := filepath.Base(source)
-	if len(fs.Args()) >= 2 {
-		target = fs.Args()[1]
+	if len(posArgs) >= 2 {
+		target = posArgs[1]
 	}
 
 	start := time.Now()
 
-	// Remote clone via HTTP/HTTPS
+	// Check if source is a Git repository (GitHub, GitLab, Bitbucket, or .git URL)
+	isGit := strings.HasSuffix(source, ".git") ||
+		strings.Contains(source, "github.com") ||
+		strings.Contains(source, "gitlab.com") ||
+		strings.Contains(source, "bitbucket.org") ||
+		strings.HasPrefix(source, "git@") ||
+		strings.HasPrefix(source, "git://")
+
+	if isGit {
+		cleanTarget := target
+		if cleanTarget == source || cleanTarget == "" || cleanTarget == "." {
+			u, err := url.Parse(source)
+			if err == nil && u.Path != "" {
+				cleanTarget = strings.TrimSuffix(filepath.Base(u.Path), ".git")
+			} else {
+				cleanTarget = "repo"
+			}
+		}
+		cleanTarget = strings.TrimSuffix(cleanTarget, ".git")
+		repoName := filepath.Base(cleanTarget)
+
+		ui.PrintInfo(fmt.Sprintf("Detected Git remote. Cloning %s into OpenScion workspace %q...", source, cleanTarget))
+
+		if _, err := exec.LookPath("git"); err != nil {
+			ui.PrintError("Git executable not found in PATH for remote git import.")
+			os.Exit(1)
+		}
+
+		var cloneArgs []string
+		if *sparseFlag != "" {
+			// Sparse clone: only download trees and requested sparse directories!
+			cloneArgs = []string{"clone", "--depth", "1", "--filter=blob:none", "--sparse", "--quiet", source, cleanTarget}
+		} else {
+			// Fast stream clone with HTTP/2, single-branch, and no tags
+			cloneArgs = []string{"-c", "http.version=HTTP/2", "clone", "--depth", "1", "--no-tags", "--single-branch", "--quiet", source, cleanTarget}
+		}
+
+		cloneCmd := exec.Command("git", cloneArgs...)
+		cloneCmd.Stdout = os.Stdout
+		cloneCmd.Stderr = os.Stderr
+		if err := cloneCmd.Run(); err != nil {
+			ui.PrintError(fmt.Sprintf("Git clone failed: %v", err))
+			os.Exit(1)
+		}
+
+		if *sparseFlag != "" {
+			sparsePatterns := strings.Split(*sparseFlag, ",")
+			var gitDirs []string
+			for _, pat := range sparsePatterns {
+				cleanPat := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(pat), "/**"), "/*")
+				if cleanPat != "" && cleanPat != "*" && cleanPat != "**" {
+					gitDirs = append(gitDirs, cleanPat)
+				}
+			}
+			if len(gitDirs) > 0 {
+				sparseArgs := append([]string{"-C", cleanTarget, "sparse-checkout", "set"}, gitDirs...)
+				_ = exec.Command("git", sparseArgs...).Run()
+			}
+		}
+
+		targetRepo, err := local.InitLocalRepo(cleanTarget, repoName)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to initialize OpenScion repo: %v", err))
+			os.Exit(1)
+		}
+		defer targetRepo.Close()
+
+		// Move cloned .git into .scion/git_bridge to support bidirectional scion push/pull!
+		gitBridgeDir := filepath.Join(targetRepo.ScionDir, "git_bridge")
+		_ = os.Rename(filepath.Join(cleanTarget, ".git"), gitBridgeDir)
+		_ = os.RemoveAll(filepath.Join(cleanTarget, ".git"))
+
+		// Configure exclude and worktree
+		infoDir := filepath.Join(gitBridgeDir, "info")
+		_ = os.MkdirAll(infoDir, 0755)
+		_ = os.WriteFile(filepath.Join(infoDir, "exclude"), []byte(".scion\n.scion/\n"), 0644)
+		_ = exec.Command("git", "--git-dir="+gitBridgeDir, "config", "core.worktree", targetRepo.WorkDir).Run()
+
+		targetRepo.Config.RemoteURL = source
+		_ = targetRepo.SaveConfig()
+
+		if *sparseFlag != "" {
+			targetRepo.Config.SparsePatterns = strings.Split(*sparseFlag, ",")
+			_ = targetRepo.SaveConfig()
+		}
+
+		ui.PrintInfo("Ingesting files into Content-Addressable Storage (CAS)...")
+		cs, err := targetRepo.Commit("feat: initial import from "+source, "OpenScion Git Importer <git@openscion.local>", "git-importer", "", "")
+		if err != nil {
+			if strings.Contains(err.Error(), "working tree clean") {
+				headCS, _ := targetRepo.GetHeadChangeset()
+				seq := int64(1)
+				shortID := "empty"
+				if headCS != nil {
+					seq = headCS.SequenceNumber
+					shortID = headCS.ShortID()
+				}
+				elapsed := time.Since(start).Milliseconds()
+				ui.PrintSuccess(fmt.Sprintf("Successfully imported %q into OpenScion in %dms! (Commit #%d %s)",
+					cleanTarget, elapsed, seq, shortID))
+				return
+			}
+			ui.PrintError(fmt.Sprintf("Failed to commit imported files: %v", err))
+			os.Exit(1)
+		}
+
+		elapsed := time.Since(start).Milliseconds()
+		ui.PrintSuccess(fmt.Sprintf("Successfully imported %q into OpenScion in %dms! (Commit #%d %s)",
+			cleanTarget, elapsed, cs.SequenceNumber, cs.ShortID()))
+		return
+	}
+
+	// Remote clone via OpenScion control plane HTTP/HTTPS
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 		u, err := url.Parse(source)
 		if err != nil {
@@ -699,7 +908,7 @@ func cmdClone(args []string) {
 		if repoName == "" || repoName == "." || repoName == "/" {
 			repoName = "repo"
 		}
-		if len(fs.Args()) < 2 {
+		if len(posArgs) < 2 {
 			target = repoName
 		}
 		serverURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
@@ -713,6 +922,9 @@ func cmdClone(args []string) {
 
 		targetRepo.Config.RemoteURL = serverURL
 		targetRepo.Config.RepoName = repoName
+		if *sparseFlag != "" {
+			targetRepo.Config.SparsePatterns = strings.Split(*sparseFlag, ",")
+		}
 		if err := targetRepo.SaveConfig(); err != nil {
 			ui.PrintError(fmt.Sprintf("Failed to save remote config: %v", err))
 			os.Exit(1)
@@ -800,7 +1012,7 @@ func cmdServe(args []string) {
 	s3BucketFlag := fs.String("s3-bucket", "", "S3 / MinIO bucket name (or S3_BUCKET env)")
 	s3EndpointFlag := fs.String("s3-endpoint", "", "S3 / MinIO endpoint host (or S3_ENDPOINT env)")
 	authFlag := fs.String("auth-token", "", "Bearer token required for API access (or SCION_AUTH_TOKEN env)")
-	fs.Parse(args)
+	parseFlagsFlexible(fs, args)
 
 	finalDB := *dbURL
 	if finalDB == "" {
@@ -1034,7 +1246,7 @@ func max(a, b int) int {
 func cmdMount(args []string) {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	revFlag := fs.String("rev", "", "Commit sequence number (#1) or ID to mount (default: HEAD)")
-	fs.Parse(args)
+	posArgs := parseFlagsFlexible(fs, args)
 
 	repo, err := local.OpenLocalRepo(".")
 	if err != nil {
@@ -1062,8 +1274,8 @@ func cmdMount(args []string) {
 	}
 
 	mountPoint := "./mnt"
-	if len(fs.Args()) > 0 {
-		mountPoint = fs.Args()[0]
+	if len(posArgs) > 0 {
+		mountPoint = posArgs[0]
 	}
 
 	opts := vfs.MountOptions{
@@ -1109,5 +1321,205 @@ func cmdGC(args []string) {
 
 	ui.PrintSuccess(fmt.Sprintf("Garbage collection complete: pruned %d unreferenced object(s), freed %.2f KB",
 		deleted, float64(freedBytes)/1024.0))
+}
+
+func cmdStash(args []string) {
+	fs := flag.NewFlagSet("stash", flag.ExitOnError)
+	msgFlag := fs.String("m", "", "Stash message")
+	posArgs := parseFlagsFlexible(fs, args)
+
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	sub := "push"
+	if len(posArgs) > 0 {
+		sub = posArgs[0]
+		posArgs = posArgs[1:]
+	}
+
+	switch sub {
+	case "push", "save":
+		stash, err := repo.SaveStash(*msgFlag)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Cannot stash: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Saved working directory and index state %s", stash.Message))
+
+	case "list":
+		stashes, err := repo.ListStashes()
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to list stashes: %v", err))
+			os.Exit(1)
+		}
+		if len(stashes) == 0 {
+			return
+		}
+		for i, s := range stashes {
+			fmt.Printf("stash@{%d}: %s\n", i, s.Message)
+		}
+
+	case "pop", "apply":
+		index := 0
+		if len(posArgs) > 0 {
+			arg := posArgs[0]
+			arg = strings.TrimPrefix(arg, "stash@{")
+			arg = strings.TrimSuffix(arg, "}")
+			if idx, err := strconv.Atoi(arg); err == nil {
+				index = idx
+			}
+		}
+
+		var stash *db.Stash
+		if sub == "pop" {
+			stash, err = repo.PopStash(index)
+		} else {
+			stash, err = repo.ApplyStash(index)
+		}
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to %s stash: %v", sub, err))
+			os.Exit(1)
+		}
+		if sub == "pop" {
+			ui.PrintSuccess(fmt.Sprintf("Dropped stash@{%d} and applied: %s", index, stash.Message))
+		} else {
+			ui.PrintSuccess(fmt.Sprintf("Applied stash@{%d}: %s", index, stash.Message))
+		}
+
+	case "drop":
+		index := 0
+		if len(posArgs) > 0 {
+			arg := posArgs[0]
+			arg = strings.TrimPrefix(arg, "stash@{")
+			arg = strings.TrimSuffix(arg, "}")
+			if idx, err := strconv.Atoi(arg); err == nil {
+				index = idx
+			}
+		}
+		stash, err := repo.DropStash(index)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to drop stash: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Dropped stash@{%d}: %s", index, stash.Message))
+
+	case "show":
+		index := 0
+		if len(posArgs) > 0 {
+			arg := posArgs[0]
+			arg = strings.TrimPrefix(arg, "stash@{")
+			arg = strings.TrimSuffix(arg, "}")
+			if idx, err := strconv.Atoi(arg); err == nil {
+				index = idx
+			}
+		}
+		diffs, err := repo.ShowStash(index)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to show stash: %v", err))
+			os.Exit(1)
+		}
+		for _, d := range diffs {
+			fmt.Printf("  %s %s\n", d.ChangeType, d.Path)
+		}
+
+	default:
+		// If unknown subcommand with no flag, treat as saving stash with that message
+		stash, err := repo.SaveStash(sub)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Cannot stash: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Saved working directory and index state %s", stash.Message))
+	}
+}
+
+func cmdSparse(args []string) {
+	repo, err := local.OpenLocalRepo(".")
+	if err != nil {
+		ui.PrintError(err.Error())
+		os.Exit(1)
+	}
+	defer repo.Close()
+
+	if len(args) == 0 || args[0] == "list" {
+		patterns := repo.Config.SparsePatterns
+		if len(patterns) == 0 || (len(patterns) == 1 && patterns[0] == "*") {
+			fmt.Printf("Sparse checkout is %sdisabled%s (full working tree active).\n", ui.Dim, ui.Reset)
+			return
+		}
+		fmt.Printf("Active sparse checkout patterns (%d):\n", len(patterns))
+		for _, p := range patterns {
+			fmt.Printf("  • %s%s%s\n", ui.Cyan, p, ui.Reset)
+		}
+		return
+	}
+
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "set":
+		if len(subArgs) == 0 {
+			ui.PrintError("Usage: scion sparse set <pattern1,pattern2...> or <pattern1> [pattern2...]")
+			os.Exit(1)
+		}
+		var patterns []string
+		for _, arg := range subArgs {
+			parts := strings.Split(arg, ",")
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					patterns = append(patterns, p)
+				}
+			}
+		}
+		count, err := repo.SetSparsePatterns(patterns)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to set sparse patterns: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Set sparse patterns (%d active); materialized %d files.", len(patterns), count))
+
+	case "add":
+		if len(subArgs) == 0 {
+			ui.PrintError("Usage: scion sparse add <pattern1> [pattern2...]")
+			os.Exit(1)
+		}
+		patterns := repo.Config.SparsePatterns
+		if len(patterns) == 1 && patterns[0] == "*" {
+			patterns = nil
+		}
+		for _, arg := range subArgs {
+			parts := strings.Split(arg, ",")
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					patterns = append(patterns, p)
+				}
+			}
+		}
+		count, err := repo.SetSparsePatterns(patterns)
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to add sparse patterns: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Updated sparse patterns (%d active); materialized %d files.", len(patterns), count))
+
+	case "clear", "disable":
+		count, err := repo.SetSparsePatterns([]string{"*"})
+		if err != nil {
+			ui.PrintError(fmt.Sprintf("Failed to clear sparse patterns: %v", err))
+			os.Exit(1)
+		}
+		ui.PrintSuccess(fmt.Sprintf("Disabled sparse checkout; materialized full working copy (%d files).", count))
+
+	default:
+		ui.PrintError(fmt.Sprintf("Unknown sparse subcommand %q. Usage: scion sparse [list|set|add|clear]", sub))
+		os.Exit(1)
+	}
 }
 

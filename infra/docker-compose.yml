@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  openscion-server:
+    image: golang:1.24-alpine
+    container_name: openscion-control-plane
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - openscion-data:/data
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - AETHER_DATA_DIR=/data
+      - DATABASE_URL=postgres://openscion:openscion_secret@postgres:5432/openscion?sslmode=disable
+      - S3_BUCKET=openscion-cas
+      - S3_ENDPOINT=minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - S3_USE_SSL=false
+    command: sh -c "go build -o /usr/local/bin/aether-server ./cmd/aether-server && /usr/local/bin/aether-server --port 8080 --data-dir /data"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: openscion-postgres
+    environment:
+      - POSTGRES_USER=openscion
+      - POSTGRES_PASSWORD=openscion_secret
+      - POSTGRES_DB=openscion
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openscion"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: openscion-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+volumes:
+  openscion-data:
+  postgres-data:
+  minio-data:

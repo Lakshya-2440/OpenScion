@@ -63,9 +63,13 @@ func ValidateManifest(m *BlobManifest) error {
 
 // Store provides content-addressable storage on local disk
 type Store struct {
-	baseDir string
-	remote  RemoteStorage
-	mu      sync.RWMutex
+	baseDir        string
+	remote         RemoteStorage
+	remoteMu       sync.RWMutex
+	bucketLock     [256]sync.Mutex
+	knownChunks    sync.Map // hash (string) -> bool
+	knownManifests sync.Map // hash (string) -> bool
+	knownDirs      sync.Map // dirPath (string) -> bool
 }
 
 // NewStore initializes a CAS directory
@@ -74,20 +78,57 @@ func NewStore(baseDir string) (*Store, error) {
 	if err := os.MkdirAll(objDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create CAS objects dir: %w", err)
 	}
-	return &Store{baseDir: baseDir}, nil
+	s := &Store{baseDir: baseDir}
+	s.knownDirs.Store(objDir, true)
+	return s, nil
+}
+
+// HasChunk checks if chunk exists in CAS in-memory cache or on disk without decompressing
+func (s *Store) HasChunk(hash string) bool {
+	if _, ok := s.knownChunks.Load(hash); ok {
+		return true
+	}
+	targetPath := s.chunkPath(hash)
+	if _, err := os.Stat(targetPath); err == nil {
+		s.knownChunks.Store(hash, true)
+		return true
+	}
+	return false
+}
+
+// HasManifest checks if manifest exists in CAS in-memory cache or on disk without reading or parsing JSON
+func (s *Store) HasManifest(blobHash string) bool {
+	if _, ok := s.knownManifests.Load(blobHash); ok {
+		return true
+	}
+	mPath := s.manifestPath(blobHash)
+	if _, err := os.Stat(mPath); err == nil {
+		s.knownManifests.Store(blobHash, true)
+		return true
+	}
+	return false
+}
+
+func (s *Store) getBucket(hash string) *sync.Mutex {
+	if len(hash) >= 2 {
+		if b0, err := hex.DecodeString(hash[:2]); err == nil && len(b0) > 0 {
+			return &s.bucketLock[b0[0]]
+		}
+	}
+	return &s.bucketLock[0]
 }
 
 // SetRemote attaches an S3 or MinIO distributed remote storage tier
 func (s *Store) SetRemote(remote RemoteStorage) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.remoteMu.Lock()
+	defer s.remoteMu.Unlock()
 	s.remote = remote
 }
 
 // GetRemote returns attached remote storage tier if any
 func (s *Store) GetRemote() RemoteStorage {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.remoteMu.RLock()
+	defer s.remoteMu.RUnlock()
 	return s.remote
 }
 
@@ -106,16 +147,32 @@ func (s *Store) chunkPath(hash string) string {
 
 // PutChunk stores a compressed chunk locally and uploads to S3 if configured
 func (s *Store) PutChunk(chunk *BlobChunk) error {
-	if err := ValidateChunk(chunk); err != nil {
-		return err
+	return s.putChunkInternal(chunk, true)
+}
+
+func (s *Store) putChunkInternal(chunk *BlobChunk, validate bool) error {
+	if s.HasChunk(chunk.Hash) {
+		return nil // Already stored and validated
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
+	if validate {
+		if err := ValidateChunk(chunk); err != nil {
+			return err
+		}
+	}
 
 	targetPath := s.chunkPath(chunk.Hash)
+	bucket := s.getBucket(chunk.Hash)
+	bucket.Lock()
+	defer bucket.Unlock()
+
 	if _, err := os.Stat(targetPath); err != nil {
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-			return err
+		dir := filepath.Dir(targetPath)
+		if _, ok := s.knownDirs.Load(dir); !ok {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return err
+			}
+			s.knownDirs.Store(dir, true)
 		}
 		tmpFile := targetPath + ".tmp"
 		if err := os.WriteFile(tmpFile, chunk.Data, 0644); err != nil {
@@ -123,10 +180,15 @@ func (s *Store) PutChunk(chunk *BlobChunk) error {
 		}
 		_ = os.Rename(tmpFile, targetPath)
 	}
+	s.knownChunks.Store(chunk.Hash, true)
+
+	s.remoteMu.RLock()
+	remoteStore := s.remote
+	s.remoteMu.RUnlock()
 
 	// Upload to S3 / MinIO backend if attached
-	if s.remote != nil {
-		if err := s.remote.PutChunk(chunk.Hash, chunk.Data); err != nil {
+	if remoteStore != nil {
+		if err := remoteStore.PutChunk(chunk.Hash, chunk.Data); err != nil {
 			return fmt.Errorf("failed to replicate chunk %s: %w", chunk.Hash, err)
 		}
 	}
@@ -135,17 +197,15 @@ func (s *Store) PutChunk(chunk *BlobChunk) error {
 
 // GetChunk retrieves chunk from local disk cache, falling back to S3/MinIO
 func (s *Store) GetChunk(hash string) (*BlobChunk, error) {
-	s.mu.RLock()
-	remoteStore := s.remote
 	targetPath := s.chunkPath(hash)
 	compressedData, err := os.ReadFile(targetPath)
-	s.mu.RUnlock()
 
 	if err == nil {
 		raw, decodeErr := decompressChunk(compressedData)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
+		s.knownChunks.Store(hash, true)
 		return &BlobChunk{
 			Hash:           hash,
 			UncompressedSz: len(raw),
@@ -153,15 +213,20 @@ func (s *Store) GetChunk(hash string) (*BlobChunk, error) {
 		}, nil
 	}
 
+	s.remoteMu.RLock()
+	remoteStore := s.remote
+	s.remoteMu.RUnlock()
+
 	// Cache miss on local disk — fetch from distributed S3 / MinIO
 	if remoteStore != nil {
 		data, s3Err := remoteStore.GetChunk(hash)
 		if s3Err == nil {
 			// Populate local cache
-			s.mu.Lock()
+			bucket := s.getBucket(hash)
+			bucket.Lock()
 			_ = os.MkdirAll(filepath.Dir(targetPath), 0755)
 			_ = os.WriteFile(targetPath, data, 0644)
-			s.mu.Unlock()
+			bucket.Unlock()
 
 			raw, decodeErr := decompressChunk(data)
 			if decodeErr != nil {
@@ -189,7 +254,7 @@ func (s *Store) PutBlob(content []byte) (*BlobManifest, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := s.PutChunk(chunk); err != nil {
+		if err := s.putChunkInternal(chunk, false); err != nil {
 			return nil, err
 		}
 
@@ -218,7 +283,7 @@ func (s *Store) PutBlob(content []byte) (*BlobManifest, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := s.PutChunk(chunk); err != nil {
+		if err := s.putChunkInternal(chunk, false); err != nil {
 			return nil, err
 		}
 		chunkHashes = append(chunkHashes, cHash)
@@ -266,7 +331,7 @@ func (s *Store) PutBlobFromFile(filePath string) (*BlobManifest, error) {
 			if err != nil {
 				return nil, err
 			}
-			if err := s.PutChunk(chunk); err != nil {
+			if err := s.putChunkInternal(chunk, false); err != nil {
 				return nil, err
 			}
 			chunkHashes = append(chunkHashes, cHash)
@@ -331,8 +396,10 @@ func (s *Store) GetBlob(manifest *BlobManifest) ([]byte, error) {
 
 // GC removes unreferenced chunks and manifests from local CAS storage
 func (s *Store) GC(referencedHashes map[string]bool) (int, int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	for i := range s.bucketLock {
+		s.bucketLock[i].Lock()
+		defer s.bucketLock[i].Unlock()
+	}
 
 	deletedCount := 0
 	var freedBytes int64
@@ -394,23 +461,46 @@ func (s *Store) manifestPath(blobHash string) string {
 
 // SaveManifest writes a BlobManifest into local CAS and syncs to remote if configured
 func (s *Store) SaveManifest(m *BlobManifest) error {
+	if s.HasManifest(m.BlobHash) {
+		return nil // Content-addressable manifest is immutable; already stored
+	}
+
 	if err := ValidateManifest(m); err != nil {
 		return err
 	}
 	mPath := s.manifestPath(m.BlobHash)
-	if err := os.MkdirAll(filepath.Dir(mPath), 0755); err != nil {
-		return err
-	}
-	data, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(mPath, data, 0644); err != nil {
-		return err
-	}
 
-	if s.remote != nil {
-		if err := s.remote.PutManifest(m.BlobHash, data); err != nil {
+	bucket := s.getBucket(m.BlobHash)
+	bucket.Lock()
+	defer bucket.Unlock()
+
+	if _, err := os.Stat(mPath); err != nil {
+		dir := filepath.Dir(mPath)
+		if _, ok := s.knownDirs.Load(dir); !ok {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return err
+			}
+			s.knownDirs.Store(dir, true)
+		}
+		data, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
+		tmpFile := mPath + ".tmp"
+		if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+			return err
+		}
+		_ = os.Rename(tmpFile, mPath)
+	}
+	s.knownManifests.Store(m.BlobHash, true)
+
+	s.remoteMu.RLock()
+	remoteStore := s.remote
+	s.remoteMu.RUnlock()
+
+	if remoteStore != nil {
+		data, _ := json.Marshal(m)
+		if err := remoteStore.PutManifest(m.BlobHash, data); err != nil {
 			return fmt.Errorf("failed to replicate manifest %s: %w", m.BlobHash, err)
 		}
 	}
@@ -442,6 +532,7 @@ func (s *Store) GetManifest(blobHash string) (*BlobManifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
+	s.knownManifests.Store(blobHash, true)
 	return &m, nil
 }
 
